@@ -910,6 +910,8 @@ def build_follow_up_options(record, action, action_args):
     base.update(profile.get("options", {}))
 
     if action == "initial_scan":
+        if action_args.get("technique"):
+            base["technique"] = action_args["technique"]
         return base
     if action == "get_current_db":
         base["getCurrentDb"] = True
@@ -947,6 +949,9 @@ def build_follow_up_options(record, action, action_args):
         base["osCmd"] = action_args.get("command") or "echo sqlmap"
     else:
         raise ValueError(f"Unsupported action '{action}'")
+
+    if action_args.get("technique"):
+        base["technique"] = action_args["technique"]
 
     return base
 

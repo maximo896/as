@@ -74,6 +74,21 @@ extract_json_value() {
   tr -d '\n' < "$file" | sed -n "s/.*\"${key}\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p"
 }
 
+extract_first_json_string_value() {
+  local file="$1"
+  shift
+  local key
+  local value
+  for key in "$@"; do
+    value="$(extract_json_value "$key" "$file")"
+    if [ -n "$value" ] && [ "$value" != "null" ]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done
+  return 1
+}
+
 login_awvs() {
   local base_url="$1"
   local workdir="$2"
@@ -96,12 +111,50 @@ graphql_request() {
   local workdir="$3"
   local body_file="$4"
   local out_file="$5"
+  local endpoint
+  local http_code
+  local tmp_out
 
-  curl -k -sS -b "${workdir}/cookies.txt" \
+  tmp_out="${out_file}.tmp"
+  for endpoint in "/graphql/" "/graphql" "/api/graphql/" "/api/graphql"; do
+    http_code="$(curl -k -sS -b "${workdir}/cookies.txt" \
+      -H "X-Auth: ${auth_token}" \
+      -H 'Content-Type: application/json' \
+      -X POST "${base_url}${endpoint}" \
+      --data-binary @"${body_file}" \
+      -o "${tmp_out}" \
+      -w '%{http_code}' || true)"
+
+    if [ "${http_code}" = "200" ] || [ "${http_code}" = "201" ]; then
+      mv "${tmp_out}" "${out_file}"
+      return 0
+    fi
+  done
+
+  rm -f "${tmp_out}"
+  : > "${out_file}"
+  return 1
+}
+
+get_api_key_from_rest() {
+  local base_url="$1"
+  local auth_token="$2"
+  local workdir="$3"
+  local out_file="${workdir}/me.json"
+  local http_code
+
+  http_code="$(curl -k -sS -b "${workdir}/cookies.txt" \
     -H "X-Auth: ${auth_token}" \
-    -H 'Content-Type: application/json' \
-    -X POST "${base_url}/graphql/" \
-    --data-binary @"${body_file}" > "${out_file}"
+    -H 'Accept: application/json' \
+    -X GET "${base_url}/api/v1/me" \
+    -o "${out_file}" \
+    -w '%{http_code}' || true)"
+
+  if [ "${http_code}" != "200" ]; then
+    return 1
+  fi
+
+  extract_first_json_string_value "${out_file}" "api_key" "apiKey" "apikey"
 }
 
 wait_for_awvs() {
@@ -162,14 +215,41 @@ if [ -z "$SESSION_TOKEN" ]; then
   exit 1
 fi
 
-printf '{"operationName":"apiKey","variables":{},"query":"query apiKey {\n  apiKey\n}"}' > "${WORKDIR}/query_api_key.json"
-graphql_request "$LOCAL_URL" "$SESSION_TOKEN" "$WORKDIR" "${WORKDIR}/query_api_key.json" "${WORKDIR}/api_key.json"
-API_KEY="$(extract_json_value "apiKey" "${WORKDIR}/api_key.json")"
+API_KEY=""
 
-if [ -z "$API_KEY" ] || [ "$API_KEY" = "null" ]; then
-  printf '{"operationName":"generateApiKey","variables":{},"query":"mutation generateApiKey {\n  generateApiKey\n}"}' > "${WORKDIR}/generate_api_key.json"
-  graphql_request "$LOCAL_URL" "$SESSION_TOKEN" "$WORKDIR" "${WORKDIR}/generate_api_key.json" "${WORKDIR}/generated_api_key.json"
-  API_KEY="$(extract_json_value "generateApiKey" "${WORKDIR}/generated_api_key.json")"
+printf '{"query":"query { apiKey }"}' > "${WORKDIR}/query_api_key.json"
+if graphql_request "$LOCAL_URL" "$SESSION_TOKEN" "$WORKDIR" "${WORKDIR}/query_api_key.json" "${WORKDIR}/api_key.json"; then
+  API_KEY="$(extract_first_json_string_value "${WORKDIR}/api_key.json" "apiKey" "apikey" || true)"
+fi
+
+if [ -z "$API_KEY" ]; then
+  printf '{"query":"query { apikey }"}' > "${WORKDIR}/query_apikey_alt.json"
+  if graphql_request "$LOCAL_URL" "$SESSION_TOKEN" "$WORKDIR" "${WORKDIR}/query_apikey_alt.json" "${WORKDIR}/api_key_alt.json"; then
+    API_KEY="$(extract_first_json_string_value "${WORKDIR}/api_key_alt.json" "apiKey" "apikey" || true)"
+  fi
+fi
+
+if [ -z "$API_KEY" ]; then
+  printf '{"query":"mutation { generateApiKey }"}' > "${WORKDIR}/generate_api_key.json"
+  if graphql_request "$LOCAL_URL" "$SESSION_TOKEN" "$WORKDIR" "${WORKDIR}/generate_api_key.json" "${WORKDIR}/generated_api_key.json"; then
+    API_KEY="$(extract_first_json_string_value "${WORKDIR}/generated_api_key.json" "generateApiKey" "apiKey" "apikey" || true)"
+  fi
+fi
+
+if [ -z "$API_KEY" ]; then
+  printf '{"query":"mutation { generateAPIKey }"}' > "${WORKDIR}/generate_api_key_upper.json"
+  if graphql_request "$LOCAL_URL" "$SESSION_TOKEN" "$WORKDIR" "${WORKDIR}/generate_api_key_upper.json" "${WORKDIR}/generated_api_key_upper.json"; then
+    API_KEY="$(extract_first_json_string_value "${WORKDIR}/generated_api_key_upper.json" "generateAPIKey" "apiKey" "apikey" || true)"
+  fi
+fi
+
+if [ -z "$API_KEY" ]; then
+  API_KEY="$(get_api_key_from_rest "$LOCAL_URL" "$SESSION_TOKEN" "$WORKDIR" || true)"
+fi
+
+if [ -z "$API_KEY" ]; then
+  echo "[!] Failed to obtain dedicated API key, fallback to session token."
+  API_KEY="$SESSION_TOKEN"
 fi
 
 if [ -z "$API_KEY" ]; then
