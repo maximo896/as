@@ -257,6 +257,20 @@ if [ -z "$API_KEY" ]; then
   exit 1
 fi
 
+echo "[*] Changing default password..."
+NEW_AWVS_PASSWORD="Awvs1@$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 12)"
+OLD_HASH="$(printf '%s' "$AWVS_PASSWORD" | sha256sum | awk '{print $1}')"
+NEW_HASH="$(printf '%s' "$NEW_AWVS_PASSWORD" | sha256sum | awk '{print $1}')"
+
+printf '{"operationName":"updatePassword","variables":{"credentials":{"email":"%s","currentPassword":"%s","newPassword":"%s"}},"query":"mutation updatePassword($credentials: ChangeCredentialsInput!) {\\n  updatePassword(credentials: $credentials)\\n}"}' "$AWVS_EMAIL" "$OLD_HASH" "$NEW_HASH" > "${WORKDIR}/update_password.json"
+
+if graphql_request "$LOCAL_URL" "$SESSION_TOKEN" "$WORKDIR" "${WORKDIR}/update_password.json" "${WORKDIR}/update_password_response.json"; then
+  AWVS_PASSWORD="$NEW_AWVS_PASSWORD"
+  echo "[+] Password changed successfully."
+else
+  echo "[-] Failed to change password, keeping default."
+fi
+
 echo ""
 echo "=========================================="
 echo "[+] AWVS Installation Complete"
