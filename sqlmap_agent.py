@@ -31,6 +31,58 @@ API_TOKEN = args.api_token or os.getenv("API_TOKEN", secrets.token_hex(16))
 FLASK_PORT = args.flask_port or int(os.getenv("FLASK_PORT", "5000"))
 DEFAULT_POLL_SECONDS = 5
 SESSION_FILE_NAME = "session.sqlite"
+DEFAULT_SQLMAP_LEVEL = 5
+DEFAULT_SQLMAP_RISK = 3
+DEFAULT_SQLMAP_THREADS = 4
+DEFAULT_SQLMAP_TIMEOUT = 20
+DEFAULT_SQLMAP_RETRIES = 4
+
+ENUM_ACTIONS = {
+    "get_current_db",
+    "get_dbs",
+    "get_tables",
+    "get_columns",
+    "dump_first_row",
+    "dump_table_data",
+}
+
+ENUMERATION_FALLBACK_PROFILES = [
+    {
+        "name": "default",
+        "label": "aggressive-default",
+        "options": {},
+    },
+    {
+        "name": "no_cast",
+        "label": "retry-no-cast",
+        "options": {
+            "noCast": True,
+            "freshQueries": True,
+            "threads": 1,
+        },
+    },
+    {
+        "name": "hex",
+        "label": "retry-hex",
+        "options": {
+            "hexConvert": True,
+            "freshQueries": True,
+            "threads": 1,
+        },
+    },
+    {
+        "name": "unstable",
+        "label": "retry-unstable-no-escape",
+        "options": {
+            "freshQueries": True,
+            "noEscape": True,
+            "unstable": True,
+            "threads": 1,
+            "timeout": 30,
+            "retries": 6,
+        },
+    },
+]
 
 CONTENT_TYPE_NAMES = {
     0: "target",
@@ -203,6 +255,7 @@ def process_next_in_queue():
                 "status": "running",
                 "action": job["action"],
                 "sqlmap_task_id": job["sqlmap_task_id"],
+                "action_args": job.get("action_args", {}),
                 "started_at": now_ts(),
             }
             record = scan_records.get(root_task_id)
@@ -256,6 +309,13 @@ def start_sqlmap_task(job):
 def finalize_job(root_task_id, sqlmap_task_id, action, error_message, return_code):
     snapshot = build_scan_snapshot(root_task_id, include_logs=False)
     record = scan_records.get(root_task_id)
+    action_args = {}
+    with queue_lock:
+        running_info = running_tasks.get(root_task_id, {})
+        if running_info.get("action") == action:
+            action_args = dict(running_info.get("action_args") or {})
+
+    fallback_job = build_empty_result_fallback_job(root_task_id, action, action_args, snapshot)
     if record:
         record["updated_at"] = now_ts()
         if error_message:
@@ -263,6 +323,8 @@ def finalize_job(root_task_id, sqlmap_task_id, action, error_message, return_cod
             record["status"] = "failed"
         else:
             record["status"] = snapshot.get("status", "terminated")
+            if not fallback_job:
+                record["last_error"] = ""
         record["phase"] = snapshot.get("phase", derive_phase(record, action))
         record["history"].append(
             {
@@ -271,17 +333,34 @@ def finalize_job(root_task_id, sqlmap_task_id, action, error_message, return_cod
                 "status": record["status"],
                 "return_code": return_code,
                 "error": error_message,
+                "fallback_index": action_args.get("fallback_index", 0),
+                "fallback_profile": get_fallback_profile(action_args.get("fallback_index", 0)).get("name"),
                 "finished_at": now_ts(),
             }
         )
         if action == "probe_shell":
             record["shell_probe"] = derive_shell_probe(snapshot)
-        if action not in record["automation"]["completed"]:
+        if fallback_job:
+            profile = get_fallback_profile(fallback_job["action_args"].get("fallback_index", 0))
+            record["last_error"] = f"Enumeration returned empty result, retrying with {profile.get('label')}"
+        elif action not in record["automation"]["completed"]:
             record["automation"]["completed"].append(action)
 
     with queue_lock:
         if root_task_id in running_tasks:
             del running_tasks[root_task_id]
+
+    if fallback_job:
+        ok, _, _ = queue_job(
+            root_task_id=fallback_job["root_task_id"],
+            sqlmap_task_id=fallback_job["sqlmap_task_id"],
+            scan_data=fallback_job["scan_data"],
+            action=fallback_job["action"],
+            action_args=fallback_job["action_args"],
+        )
+        if ok:
+            process_next_in_queue()
+            return
 
     next_job = build_next_automation_job(root_task_id, snapshot)
     if next_job:
@@ -752,6 +831,56 @@ def has_dump_preview(snapshot, database_name, table_name):
     return False
 
 
+def get_fallback_profile(index):
+    try:
+        normalized = int(index or 0)
+    except (TypeError, ValueError):
+        normalized = 0
+    normalized = max(0, min(normalized, len(ENUMERATION_FALLBACK_PROFILES) - 1))
+    return ENUMERATION_FALLBACK_PROFILES[normalized]
+
+
+def action_has_meaningful_result(snapshot, action, action_args):
+    content = snapshot.get("content", {})
+    database_name = action_args.get("db") or get_first_database(snapshot)
+    table_name = action_args.get("table") or get_first_table(snapshot, database_name)
+
+    if action == "get_current_db":
+        return bool(content.get("current_db"))
+    if action == "get_dbs":
+        return isinstance(content.get("dbs"), list) and bool(content.get("dbs"))
+    if action == "get_tables":
+        tables = content.get("tables")
+        if not isinstance(tables, dict):
+            return False
+        if database_name:
+            return bool(tables.get(database_name))
+        return any(bool(value) for value in tables.values())
+    if action == "get_columns":
+        return bool(database_name and table_name and has_columns_for_table(snapshot, database_name, table_name))
+    if action in ("dump_first_row", "dump_table_data"):
+        return bool(database_name and table_name and has_dump_preview(snapshot, database_name, table_name))
+    return True
+
+
+def build_empty_result_fallback_job(root_task_id, action, action_args, snapshot):
+    if action not in ENUM_ACTIONS:
+        return None
+    if action_has_meaningful_result(snapshot, action, action_args):
+        return None
+
+    current_index = int(action_args.get("fallback_index") or 0)
+    next_index = current_index + 1
+    if next_index >= len(ENUMERATION_FALLBACK_PROFILES):
+        return None
+
+    next_args = dict(action_args or {})
+    next_args["fallback_index"] = next_index
+    next_args["db"] = next_args.get("db") or get_first_database(snapshot)
+    next_args["table"] = next_args.get("table") or get_first_table(snapshot, next_args.get("db"))
+    return build_automation_job(root_task_id, action, next_args)
+
+
 def create_follow_up_sqlmap_task():
     new_task_res = sqlmap_request("GET", "/task/new")
     task_id = new_task_res.get("taskid")
@@ -761,14 +890,24 @@ def create_follow_up_sqlmap_task():
 
 
 def build_follow_up_options(record, action, action_args):
+    profile = get_fallback_profile(action_args.get("fallback_index", 0))
     base = {
         "requestFile": os.path.abspath(record["request_file"]),
         "outputDir": os.path.abspath(record["scan_root"]),
         "batch": True,
         "forceSSL": record["force_ssl"],
-        "level": 5,
-        "risk": 3,
+        "level": DEFAULT_SQLMAP_LEVEL,
+        "risk": DEFAULT_SQLMAP_RISK,
+        "randomAgent": True,
+        "smart": True,
+        "parseErrors": True,
+        "keepAlive": True,
+        "skipWaf": True,
+        "threads": DEFAULT_SQLMAP_THREADS,
+        "timeout": DEFAULT_SQLMAP_TIMEOUT,
+        "retries": DEFAULT_SQLMAP_RETRIES,
     }
+    base.update(profile.get("options", {}))
 
     if action == "initial_scan":
         return base
