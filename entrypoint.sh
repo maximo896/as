@@ -1,66 +1,58 @@
 #!/bin/bash
 set -e
 
-API_TOKEN=${API_TOKEN:-$(python3 -c "import secrets; print(secrets.token_hex(16))")}
-MAX_CONCURRENT=${MAX_CONCURRENT:-10}
-SQLMAPAPI_PORT=${SQLMAPAPI_PORT:-$(python3 -c "import random; print(random.randint(20000,60000))")}
+while getopts "n:p:c:" opt; do
+  case $opt in
+    n) AGENT_NAME="$OPTARG" ;;
+    p) AGENT_PORT="$OPTARG" ;;
+    c) MAX_CONCURRENT="$OPTARG" ;;
+  esac
+done
 
-echo "[*] Sqlmap Agent starting..."
-echo "[*] API_TOKEN: $API_TOKEN"
-echo "[*] MAX_CONCURRENT: $MAX_CONCURRENT"
-echo "[*] SQLMAPAPI_PORT: $SQLMAPAPI_PORT"
+AGENT_NAME="${AGENT_NAME:-agent}"
+AGENT_PORT="${AGENT_PORT:-5000}"
+MAX_CONCURRENT="${MAX_CONCURRENT:-10}"
 
-mkdir -p /app/output
-
-if ! command -v sqlmapapi.py &>/dev/null; then
-    echo "[*] Downloading sqlmap source for sqlmapapi.py..."
-    if command -v git &>/dev/null; then
-        git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /tmp/sqlmap-source
-    else
-        mkdir -p /tmp/sqlmap-source
-        curl -sL https://github.com/sqlmapproject/sqlmap/archive/refs/heads/master.tar.gz | tar xz -C /tmp/sqlmap-source --strip-components=1
-    fi
+if ! command -v curl >/dev/null 2>&1; then
+  apt-get update && apt-get install -y curl
 fi
 
-SQLMAPAPI_BIN="/tmp/sqlmap-source/sqlmapapi.py"
-
-echo "[*] Starting sqlmapapi on port $SQLMAPAPI_PORT..."
-python3 "$SQLMAPAPI_BIN" -s -H 127.0.0.1 -p "$SQLMAPAPI_PORT" &
-sleep 3
-
-echo "[*] Starting Sqlmap Agent..."
-
-SERVER_IP=${SERVER_IP:-$(hostname -I | awk '{print $1}')}
-if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" = "127.0.0.1" ]; then
-    SERVER_IP="YOUR_SERVER_IP"
+if ! command -v docker >/dev/null 2>&1; then
+  curl -fsSL https://get.docker.com | sh
 fi
 
-python3 /app/sqlmap_agent.py \
-    --sqlmapapi-port "$SQLMAPAPI_PORT" \
-    --api-token "$API_TOKEN" \
-    --max-concurrent "$MAX_CONCURRENT" &
+if ! docker info >/dev/null 2>&1; then
+  systemctl start docker 2>/dev/null || service docker start 2>/dev/null || true
+fi
+
+if ! docker info >/dev/null 2>&1; then
+  echo "docker not ready"
+  exit 1
+fi
+
+TMP=$(mktemp -d)
+curl -fsSL https://github.com/maximo896/as/archive/refs/heads/main.tar.gz | tar xz -C "$TMP" --strip-components=1
+
+PUBLIC_HOST=$(curl -fsSL https://api.ipify.org 2>/dev/null || true)
+if [ -z "$PUBLIC_HOST" ]; then
+  PUBLIC_HOST=$(hostname -I | awk '{print $1}')
+fi
+
+IMAGE=sqlmap-agent:latest
+docker build -t "$IMAGE" "$TMP"
+
+CN="sqlmap-agent-${AGENT_NAME}"
+docker rm -f "$CN" >/dev/null 2>&1 || true
+
+docker run -d \
+  --name "$CN" \
+  -p "${AGENT_PORT}:5000" \
+  -e AGENT_NAME="$AGENT_NAME" \
+  -e MAX_CONCURRENT="$MAX_CONCURRENT" \
+  -e PUBLIC_HOST="$PUBLIC_HOST" \
+  -e HOST_PORT="$AGENT_PORT" \
+  --restart always \
+  "$IMAGE" >/dev/null
 
 sleep 3
-
-AGENT_PORT=${AGENT_PORT:-5000}
-
-echo ""
-echo "=========================================="
-echo "[+] Agent Running"
-echo "=========================================="
-echo ""
-echo "Agent URL: http://$SERVER_IP:$AGENT_PORT"
-echo "API Token: $API_TOKEN"
-echo ""
-
-ENCODED=$(python3 -c "
-import base64, json
-d = {'name':'$AGENT_NAME','url':'http://$SERVER_IP:$AGENT_PORT','api_key':'$API_TOKEN','max_concurrency':$MAX_CONCURRENT}
-print('sqlmapagent://' + base64.b64encode(json.dumps(d).encode()).decode())
-")
-
-echo "Copy the following link to register this agent:"
-echo "$ENCODED"
-echo ""
-
-wait
+docker logs --tail 50 "$CN"
