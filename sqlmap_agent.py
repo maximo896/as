@@ -456,6 +456,125 @@ def merge_content(previous, current):
     return merged
 
 
+def choose_priority_table(table_names):
+    if not table_names:
+        return None
+    ordered = sorted(table_names)
+    for table_name in ordered:
+        if "adm" in str(table_name).lower():
+            return table_name
+    return ordered[0]
+
+
+def build_tree(content, dump_files):
+    tree = {"databases": []}
+    database_map = {}
+
+    def ensure_database(name):
+        db_name = name or "current"
+        if db_name not in database_map:
+            database_map[db_name] = {
+                "name": db_name,
+                "tables": [],
+                "_table_map": {},
+            }
+        return database_map[db_name]
+
+    def ensure_table(database, table_name):
+        if table_name not in database["_table_map"]:
+            database["_table_map"][table_name] = {
+                "name": table_name,
+                "columns": [],
+                "column_types": {},
+                "rows": [],
+            }
+        return database["_table_map"][table_name]
+
+    tables = content.get("tables")
+    if isinstance(tables, dict):
+        for db_name, table_list in tables.items():
+            database = ensure_database(db_name)
+            if isinstance(table_list, list):
+                for table_name in table_list:
+                    ensure_table(database, table_name)
+
+    columns = content.get("columns")
+    if isinstance(columns, dict):
+        for db_name, table_map in columns.items():
+            database = ensure_database(db_name)
+            if not isinstance(table_map, dict):
+                continue
+            for table_name, column_map in table_map.items():
+                table = ensure_table(database, table_name)
+                if isinstance(column_map, dict):
+                    table["column_types"] = column_map
+                    table["columns"] = sorted(column_map.keys())
+
+    for dump_file in dump_files or []:
+        database = ensure_database(dump_file.get("database"))
+        preview = dump_file.get("preview", {})
+        for table_name, table_preview in preview.items():
+            table = ensure_table(database, table_name)
+            preview_columns = table_preview.get("columns", [])
+            if preview_columns:
+                table["columns"] = preview_columns
+            if table_preview.get("rows"):
+                table["rows"] = table_preview["rows"]
+
+    databases = []
+    for database in database_map.values():
+        table_names = list(database["_table_map"].keys())
+        priority_table = choose_priority_table(table_names)
+        tables_list = []
+        for table_name in sorted(table_names):
+            table = database["_table_map"][table_name]
+            table["priority"] = table_name == priority_table
+            tables_list.append(table)
+        databases.append(
+            {
+                "name": database["name"],
+                "priority_table": priority_table,
+                "tables": tables_list,
+            }
+        )
+
+    databases.sort(key=lambda item: item["name"])
+    tree["databases"] = databases
+    return tree
+
+
+def build_search_results(tree, term):
+    results = []
+    needle = (term or "").strip().lower()
+    if not needle:
+        return results
+
+    for database in tree.get("databases", []):
+        db_name = database.get("name", "")
+        if needle in db_name.lower():
+            results.append({"kind": "database", "database": db_name, "table": "", "column": "", "value": db_name})
+        for table in database.get("tables", []):
+            table_name = table.get("name", "")
+            if needle in table_name.lower():
+                results.append({"kind": "table", "database": db_name, "table": table_name, "column": "", "value": table_name})
+            for column in table.get("columns", []):
+                if needle in str(column).lower():
+                    results.append({"kind": "column", "database": db_name, "table": table_name, "column": column, "value": column})
+            for row in table.get("rows", []):
+                for column_name, column_value in row.items():
+                    if needle in str(column_value).lower():
+                        results.append(
+                            {
+                                "kind": "data",
+                                "database": db_name,
+                                "table": table_name,
+                                "column": column_name,
+                                "value": str(column_value),
+                            }
+                        )
+    return results[:200]
+
+
 def derive_shell_probe(snapshot):
     logs = [entry.get("message", "") for entry in snapshot.get("logs", [])]
     errors = snapshot.get("errors", [])
@@ -568,6 +687,8 @@ def build_scan_snapshot(root_task_id, include_logs=True):
         "automation": record.get("automation", {}),
         "shell_probe": record.get("shell_probe", {}),
     }
+    snapshot["tree"] = build_tree(content, dump_files)
+    snapshot["search_results"] = []
     snapshot["status"] = derive_status_from_snapshot(snapshot)
     snapshot["phase"] = derive_human_phase(snapshot)
     return snapshot
@@ -605,10 +726,10 @@ def get_first_table(snapshot, database_name):
     if isinstance(tables, dict):
         table_list = tables.get(database_name) or []
         if table_list:
-            return table_list[0]
+            return choose_priority_table(table_list)
     for dump_file in snapshot.get("dump_files", []):
         if dump_file.get("database") == database_name and dump_file.get("tables"):
-            return dump_file["tables"][0]
+            return choose_priority_table(dump_file["tables"])
     return None
 
 
@@ -674,6 +795,15 @@ def build_follow_up_options(record, action, action_args):
             base["db"] = action_args["db"]
         if action_args.get("table"):
             base["tbl"] = action_args["table"]
+    elif action == "dump_table_data":
+        base["dumpTable"] = True
+        base["dumpFormat"] = "SQLITE"
+        base["limitStart"] = int(action_args.get("limit_start") or 1)
+        base["limitStop"] = int(action_args.get("limit_stop") or 20)
+        if action_args.get("db"):
+            base["db"] = action_args["db"]
+        if action_args.get("table"):
+            base["tbl"] = action_args["table"]
     elif action == "probe_shell":
         base["osCmd"] = action_args.get("command") or "echo sqlmap"
     else:
@@ -724,8 +854,8 @@ def build_next_automation_job(root_task_id, snapshot):
     if "get_columns" not in completed and database_name and table_name and not has_columns_for_table(snapshot, database_name, table_name):
         return build_automation_job(root_task_id, "get_columns", {"db": database_name, "table": table_name})
 
-    if "dump_first_row" not in completed and database_name and table_name and not has_dump_preview(snapshot, database_name, table_name):
-        return build_automation_job(root_task_id, "dump_first_row", {"db": database_name, "table": table_name})
+    if "dump_table_data" not in completed and database_name and table_name and not has_dump_preview(snapshot, database_name, table_name):
+        return build_automation_job(root_task_id, "dump_table_data", {"db": database_name, "table": table_name, "limit_start": 1, "limit_stop": 20})
 
     if "probe_shell" not in completed:
         return build_automation_job(root_task_id, "probe_shell")
@@ -835,7 +965,7 @@ def run_action(root_task_id):
 
     data = request.json or {}
     action = data.get("action")
-    if action not in ("get_current_db", "get_dbs", "get_tables", "get_columns", "dump_first_row", "probe_shell"):
+    if action not in ("get_current_db", "get_dbs", "get_tables", "get_columns", "dump_first_row", "dump_table_data", "probe_shell"):
         return jsonify({"error": "Unsupported action"}), 400
 
     snapshot = build_scan_snapshot(root_task_id, include_logs=False)
@@ -843,6 +973,8 @@ def run_action(root_task_id):
         "db": data.get("db") or get_first_database(snapshot),
         "table": data.get("table") or get_first_table(snapshot, data.get("db") or get_first_database(snapshot)),
         "command": data.get("command"),
+        "limit_start": data.get("limit_start"),
+        "limit_stop": data.get("limit_stop"),
     }
 
     try:
@@ -856,6 +988,17 @@ def run_action(root_task_id):
         return jsonify({"error": message}), 409
     status_code = 202 if message == "Task queued" else 200
     return jsonify({"message": message, "task_id": root_task_id, "action": action, "sqlmap_task_id": sqlmap_task_id}), status_code
+
+
+@app.route("/scan/<root_task_id>/search", methods=["GET"])
+@require_auth
+def search_scan(root_task_id):
+    snapshot = build_scan_snapshot(root_task_id, include_logs=False)
+    if snapshot.get("error"):
+        return jsonify(snapshot), 404
+    query = request.args.get("q", "")
+    results = build_search_results(snapshot.get("tree", {}), query)
+    return jsonify({"task_id": root_task_id, "query": query, "results": results})
 
 
 @app.route("/data/<root_task_id>", methods=["GET"])
