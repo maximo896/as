@@ -38,8 +38,8 @@ if [ -z "$PUBLIC_HOST" ]; then
   PUBLIC_HOST=$(hostname -I | awk '{print $1}')
 fi
 
-IMAGE=sqlmap-agent:latest
-docker build -t "$IMAGE" "$TMP"
+IMAGE="sqlmap-agent:${AGENT_NAME}"
+docker build --pull --no-cache -t "$IMAGE" "$TMP"
 
 CN="sqlmap-agent-${AGENT_NAME}"
 docker rm -f "$CN" >/dev/null 2>&1 || true
