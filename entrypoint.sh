@@ -54,5 +54,25 @@ docker run -d \
   --restart always \
   "$IMAGE" >/dev/null
 
-sleep 3
-docker logs --tail 50 "$CN"
+echo ""
+echo "[*] Waiting for sqlmapagent:// link..."
+PROTO=""
+for i in $(seq 1 20); do
+  PROTO=$(docker logs "$CN" 2>/dev/null | grep -m1 'sqlmapagent://' || true)
+  if [ -n "$PROTO" ]; then
+    break
+  fi
+  sleep 1
+done
+
+echo ""
+echo "=========================================="
+echo "[+] Installation Complete!"
+echo "=========================================="
+echo ""
+if [ -n "$PROTO" ]; then
+  echo "$PROTO"
+else
+  echo "[!] Protocol link not found in logs, showing last 80 lines:"
+  docker logs --tail 80 "$CN"
+fi
