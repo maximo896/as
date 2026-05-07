@@ -12,6 +12,33 @@ done
 AGENT_NAME="${AGENT_NAME:-awvs}"
 AGENT_PORT="${AGENT_PORT:-$((30000 + RANDOM % 10001))}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-5}"
+
+check_port_free() {
+  local port="$1"
+  # 检查是否被 Docker 占用
+  if docker ps --format '{{.Ports}}' | grep -q ":${port}->"; then
+    return 1
+  fi
+  # 检查系统是否监听该端口 (如果 nc 可用)
+  if command -v nc >/dev/null 2>&1; then
+    if nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
+      return 1
+    fi
+  else
+    # fallback to bash /dev/tcp
+    if (echo >/dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# 如果指定的端口已被占用，则自动重新分配随机端口
+while ! check_port_free "$AGENT_PORT"; do
+  echo "[!] Port $AGENT_PORT is already in use. Assigning a new random port..."
+  AGENT_PORT="$((30000 + RANDOM % 10001))"
+done
+
 AWVS_EMAIL="admin@admin.com"
 AWVS_PASSWORD="Admin123"
 AWVS_CONTAINER_PORT="3443"
