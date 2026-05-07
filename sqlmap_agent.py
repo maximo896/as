@@ -660,13 +660,13 @@ def derive_shell_probe(snapshot):
     session = snapshot.get("session", {})
     xp_cmdshell = session.get("xp_cmdshell_available")
     if xp_cmdshell is True:
-        return {"status": "available", "message": "xp_cmdshell detected"}
+        return {"ok": True, "status": "available", "message": "xp_cmdshell detected"}
     joined = " ".join(logs + [str(item) for item in errors]).lower()
     if any(token in joined for token in ("os cmd", "command execution", "xp_cmdshell")) and "not possible" not in joined:
-        return {"status": "possible", "message": "sqlmap reported command execution capability"}
+        return {"ok": False, "status": "possible", "message": "sqlmap reported command execution capability"}
     if "not possible" in joined or "unable" in joined or errors:
-        return {"status": "failed", "message": errors[0] if errors else "command execution probe failed"}
-    return {"status": "unknown", "message": ""}
+        return {"ok": False, "status": "failed", "message": errors[0] if errors else "command execution probe failed"}
+    return {"ok": False, "status": "unknown", "message": ""}
 
 
 def derive_status_from_snapshot(snapshot):
