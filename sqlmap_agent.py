@@ -434,6 +434,18 @@ def find_dump_sqlite_files(record):
     return sorted(results)
 
 
+def read_text_file(path, max_size=2 * 1024 * 1024):
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        if os.path.getsize(path) > max_size:
+            return ""
+        with open(path, "rt", encoding="utf8", errors="replace") as file_handle:
+            return file_handle.read()
+    except Exception:
+        return ""
+
+
 def read_dump_sqlite_file(path):
     database_name = os.path.splitext(os.path.basename(path))[0]
     conn = sqlite3.connect(path)
@@ -754,6 +766,7 @@ def build_scan_snapshot(root_task_id, include_logs=True):
         "domain": record.get("domain"),
         "vuln_id": record.get("vuln_id"),
         "request_file": record.get("request_file"),
+        "request_content": read_text_file(record.get("request_file")),
         "scan_root": record.get("scan_root"),
         "force_ssl": record.get("force_ssl"),
         "last_error": record.get("last_error"),
