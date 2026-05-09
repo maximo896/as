@@ -112,7 +112,7 @@ docker run -d \
   --network "$NETWORK_NAME" \
   --restart always \
   -v "$CONFIG_PATH:/etc/xray/config.json" \
-  teddysun/xray >/dev/null
+  ghcr.io/xtls/xray-core:latest >/dev/null
 
 echo "proxy gateway started: ${GATEWAY_CN}"
 echo "proxy url for sqlmap: http://${GATEWAY_CN}:18080"

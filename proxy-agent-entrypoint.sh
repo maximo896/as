@@ -153,7 +153,7 @@ docker run -d \
   --restart always \
   -p "${LISTEN_PORT}:${LISTEN_PORT}" \
   -v "$CONFIG_PATH:/etc/xray/config.json" \
-  teddysun/xray >/dev/null
+  ghcr.io/xtls/xray-core:latest >/dev/null
 
 echo ""
 echo "=========================================="
