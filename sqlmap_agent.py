@@ -1251,6 +1251,32 @@ def update_scan_proxy(root_task_id):
     )
 
 
+@app.route("/scan/<root_task_id>/request", methods=["PUT"])
+@require_auth
+def update_scan_request(root_task_id):
+    record = scan_records.get(root_task_id)
+    if not record:
+        return jsonify({"error": "Task not found"}), 404
+    data = request.json or {}
+    request_content = data.get("request_content")
+    if request_content is None:
+        return jsonify({"error": "request_content is required"}), 400
+    request_file = record.get("request_file")
+    if not request_file:
+        return jsonify({"error": "request file not found"}), 400
+    os.makedirs(os.path.dirname(os.path.abspath(request_file)), exist_ok=True)
+    with open(request_file, "wt", encoding="utf8", newline="") as file_handle:
+        file_handle.write(request_content)
+    return jsonify(
+        {
+            "message": "request updated",
+            "task_id": root_task_id,
+            "request_file": request_file,
+            "request_content": read_text_file(request_file),
+        }
+    )
+
+
 @app.route("/data/<root_task_id>", methods=["GET"])
 @require_auth
 def get_data(root_task_id):
