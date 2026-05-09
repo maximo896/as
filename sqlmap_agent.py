@@ -211,6 +211,8 @@ def create_record(root_task_id, domain, vuln_id, request_file, scan_root, force_
             "message": "",
         },
         "proxy": "",
+        "runtime_proxy": "",
+        "runtime_proxy_file": "",
     }
     scan_records[root_task_id] = record
     return record
@@ -286,6 +288,7 @@ def start_sqlmap_task(job):
         if not start_res.get("success", True):
             error_message = start_res.get("message", "Failed to start sqlmap task")
         else:
+            refresh_runtime_proxy(root_task_id)
             while True:
                 status_res = sqlmap_request("GET", f"/scan/{sqlmap_task_id}/status")
                 status = status_res.get("status", "unknown")
@@ -779,6 +782,9 @@ def build_scan_snapshot(root_task_id, include_logs=True):
         "history": record.get("history", []),
         "automation": record.get("automation", {}),
         "shell_probe": record.get("shell_probe", {}),
+        "requested_proxy": record.get("proxy", ""),
+        "runtime_proxy": record.get("runtime_proxy", ""),
+        "runtime_proxy_file": record.get("runtime_proxy_file", ""),
     }
     snapshot["tree"] = build_tree(content, dump_files)
     snapshot["search_results"] = []
@@ -901,6 +907,67 @@ def create_follow_up_sqlmap_task():
     if not task_id:
         raise RuntimeError("Failed to allocate sqlmap task")
     return task_id
+
+
+def parse_sqlmap_config(content):
+    result = {}
+    for raw_line in (content or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        result[key.strip().lower()] = value.strip()
+    return result
+
+
+def find_runtime_sqlmap_config(record):
+    request_file = os.path.abspath(record.get("request_file", ""))
+    scan_root = os.path.abspath(record.get("scan_root", ""))
+    if not request_file and not scan_root:
+        return "", ""
+
+    candidates = []
+    for root in ("/tmp", "/var/tmp"):
+        if not os.path.isdir(root):
+            continue
+        try:
+            for name in os.listdir(root):
+                if not name.startswith("sqlmapconfig-"):
+                    continue
+                path = os.path.join(root, name)
+                if os.path.isfile(path):
+                    candidates.append(path)
+        except Exception:
+            continue
+
+    candidates.sort(key=lambda item: os.path.getmtime(item), reverse=True)
+    for path in candidates:
+        content = read_text_file(path, max_size=256 * 1024)
+        if not content:
+            continue
+        parsed = parse_sqlmap_config(content)
+        req_val = os.path.abspath(parsed.get("requestfile", ""))
+        out_val = os.path.abspath(parsed.get("outputdir", ""))
+        if request_file and req_val == request_file:
+            return path, content
+        if scan_root and out_val.startswith(scan_root):
+            return path, content
+    return "", ""
+
+
+def refresh_runtime_proxy(root_task_id):
+    record = scan_records.get(root_task_id)
+    if not record:
+        return
+    cfg_file, cfg_content = find_runtime_sqlmap_config(record)
+    runtime_proxy = ""
+    if cfg_content:
+        parsed = parse_sqlmap_config(cfg_content)
+        runtime_proxy = parsed.get("proxy", "") or ""
+    record["runtime_proxy"] = runtime_proxy
+    record["runtime_proxy_file"] = cfg_file
 
 
 def build_follow_up_options(record, action, action_args):
@@ -1172,7 +1239,16 @@ def update_scan_proxy(root_task_id):
     data = request.json or {}
     proxy = (data.get("proxy") or "").strip()
     record["proxy"] = proxy
-    return jsonify({"message": "proxy updated", "task_id": root_task_id, "proxy": proxy})
+    refresh_runtime_proxy(root_task_id)
+    return jsonify(
+        {
+            "message": "proxy updated",
+            "task_id": root_task_id,
+            "proxy": proxy,
+            "runtime_proxy": record.get("runtime_proxy", ""),
+            "runtime_proxy_file": record.get("runtime_proxy_file", ""),
+        }
+    )
 
 
 @app.route("/data/<root_task_id>", methods=["GET"])
