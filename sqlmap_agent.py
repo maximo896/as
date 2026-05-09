@@ -1163,6 +1163,18 @@ def search_scan(root_task_id):
     return jsonify({"task_id": root_task_id, "query": query, "results": results})
 
 
+@app.route("/scan/<root_task_id>/proxy", methods=["PUT"])
+@require_auth
+def update_scan_proxy(root_task_id):
+    record = scan_records.get(root_task_id)
+    if not record:
+        return jsonify({"error": "Task not found"}), 404
+    data = request.json or {}
+    proxy = (data.get("proxy") or "").strip()
+    record["proxy"] = proxy
+    return jsonify({"message": "proxy updated", "task_id": root_task_id, "proxy": proxy})
+
+
 @app.route("/data/<root_task_id>", methods=["GET"])
 @require_auth
 def get_data(root_task_id):
