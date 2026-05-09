@@ -27,7 +27,12 @@ TUNNEL_PASSWORD="${TUNNEL_PASSWORD:-}"
 TRANSPORT="vless"
 
 sanitize_name() {
-  echo "$1" | tr -cs 'a-zA-Z0-9._-' '-'
+  local n
+  n="$(echo "$1" | tr -cs 'a-zA-Z0-9._-' '-' | sed 's/^[._-]*//; s/[._-]*$//' | tr 'A-Z' 'a-z')"
+  if [ -z "$n" ]; then
+    n="agent"
+  fi
+  echo "$n"
 }
 
 new_uuid() {
@@ -153,7 +158,7 @@ docker run -d \
   --restart always \
   -p "${LISTEN_PORT}:${LISTEN_PORT}" \
   -v "$CONFIG_PATH:/etc/xray/config.json" \
-  ghcr.io/xtls/xray-core:latest >/dev/null
+  ghcr.io/xtls/xray-core:latest run -config /etc/xray/config.json >/dev/null
 
 echo ""
 echo "=========================================="

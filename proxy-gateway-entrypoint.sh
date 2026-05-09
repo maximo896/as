@@ -117,14 +117,7 @@ docker run -d \
   --network "$NETWORK_NAME" \
   --restart always \
   -v "$CONFIG_PATH:/etc/xray/config.json" \
-  ghcr.io/xtls/xray-core:latest >/dev/null
-
-sleep 1
-if ! docker exec "$GATEWAY_CN" sh -lc "ss -ltn | grep -q ':18080'"; then
-  echo "proxy gateway failed to listen on 18080"
-  docker logs --tail 100 "$GATEWAY_CN" || true
-  exit 1
-fi
+  ghcr.io/xtls/xray-core:latest run -config /etc/xray/config.json >/dev/null
 
 echo "proxy gateway started: ${GATEWAY_CN}"
 echo "proxy url for sqlmap: http://${GATEWAY_CN}:18080"

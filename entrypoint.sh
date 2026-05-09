@@ -16,7 +16,12 @@ MAX_CONCURRENT="${MAX_CONCURRENT:-10}"
 PROXY_AGENT_LINK="${PROXY_AGENT_LINK:-}"
 
 sanitize_name() {
-  echo "$1" | tr -cs 'a-zA-Z0-9._-' '-'
+  local n
+  n="$(echo "$1" | tr -cs 'a-zA-Z0-9._-' '-' | sed 's/^[._-]*//; s/[._-]*$//' | tr 'A-Z' 'a-z')"
+  if [ -z "$n" ]; then
+    n="agent"
+  fi
+  echo "$n"
 }
 
 if ! command -v curl >/dev/null 2>&1; then
