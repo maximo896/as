@@ -210,6 +210,7 @@ def create_record(root_task_id, domain, vuln_id, request_file, scan_root, force_
             "status": "unknown",
             "message": "",
         },
+        "proxy": "",
     }
     scan_records[root_task_id] = record
     return record
@@ -921,6 +922,8 @@ def build_follow_up_options(record, action, action_args):
         "retries": DEFAULT_SQLMAP_RETRIES,
     }
     base.update(profile.get("options", {}))
+    if record.get("proxy"):
+        base["proxy"] = record["proxy"]
 
     if action == "initial_scan":
         if action_args.get("technique"):
@@ -1083,6 +1086,7 @@ def start_scan():
     vuln_id = data.get("vuln_id")
     request_data = data.get("request_data")
     force_ssl = bool(data.get("force_ssl", False))
+    proxy = data.get("proxy") or ""
 
     if not all([domain, vuln_id, request_data]):
         return jsonify({"error": "Missing required fields"}), 400
@@ -1095,7 +1099,8 @@ def start_scan():
         file_handle.write(request_data)
 
     root_task_id = create_follow_up_sqlmap_task()
-    create_record(root_task_id, domain, vuln_id, request_file, scan_root, force_ssl)
+    record = create_record(root_task_id, domain, vuln_id, request_file, scan_root, force_ssl)
+    record["proxy"] = proxy
     scan_data = build_follow_up_options(scan_records[root_task_id], "initial_scan", {})
     ok, message, _ = queue_job(root_task_id, root_task_id, scan_data, "initial_scan")
     status_code = 202 if message == "Task queued" else 200
