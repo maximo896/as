@@ -37,6 +37,7 @@ DEFAULT_SQLMAP_RISK = 3
 DEFAULT_SQLMAP_THREADS = 4
 DEFAULT_SQLMAP_TIMEOUT = 20
 DEFAULT_SQLMAP_RETRIES = 4
+AGENT_VERSION = "2.1.0"
 
 ENUM_ACTIONS = {
     "get_current_db",
@@ -1328,7 +1329,7 @@ def get_info():
             "max_concurrent": MAX_CONCURRENT_SCANS,
             "sqlmapapi_url": sqlmapapi_base(),
             "agent_port": FLASK_PORT,
-            "version": "2.0",
+            "version": AGENT_VERSION,
         }
     )
 
@@ -1345,6 +1346,7 @@ def get_status():
             "max_concurrent": MAX_CONCURRENT_SCANS,
             "queued_count": queued_count,
             "scan_count": len(scan_records),
+            "version": AGENT_VERSION,
         }
     )
 
