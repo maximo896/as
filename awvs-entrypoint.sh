@@ -15,11 +15,11 @@ MAX_CONCURRENT="${MAX_CONCURRENT:-5}"
 
 check_port_free() {
   local port="$1"
-  # 检查是否被 Docker 占用
+  # Check whether Docker already binds this port.
   if docker ps --format '{{.Ports}}' | grep -q ":${port}->"; then
     return 1
   fi
-  # 检查系统是否监听该端口 (如果 nc 可用)
+  # Check whether the host already listens on this port.
   if command -v nc >/dev/null 2>&1; then
     if nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
       return 1
@@ -33,7 +33,7 @@ check_port_free() {
   return 0
 }
 
-# 如果指定的端口已被占用，则自动重新分配随机端口
+# Re-allocate a random port when the requested one is occupied.
 while ! check_port_free "$AGENT_PORT"; do
   echo "[!] Port $AGENT_PORT is already in use. Assigning a new random port..."
   AGENT_PORT="$((30000 + RANDOM % 10001))"

@@ -31,6 +31,7 @@ API_TOKEN = args.api_token or os.getenv("API_TOKEN", secrets.token_hex(16))
 FLASK_PORT = args.flask_port or int(os.getenv("FLASK_PORT", "5000"))
 DEFAULT_POLL_SECONDS = 5
 SESSION_FILE_NAME = "session.sqlite"
+METADATA_FILE_NAME = "record.json"
 DEFAULT_SQLMAP_LEVEL = 5
 DEFAULT_SQLMAP_RISK = 3
 DEFAULT_SQLMAP_THREADS = 4
@@ -44,6 +45,7 @@ ENUM_ACTIONS = {
     "get_columns",
     "dump_first_row",
     "dump_table_data",
+    "search_column",
 }
 
 ENUMERATION_FALLBACK_PROFILES = [
@@ -154,6 +156,89 @@ def now_ts():
     return int(time.time())
 
 
+def metadata_file_path(scan_root):
+    return os.path.join(scan_root, METADATA_FILE_NAME)
+
+
+def record_defaults(record):
+    record.setdefault("active_task_id", record.get("root_task_id"))
+    record.setdefault("status", "queued")
+    record.setdefault("phase", "queued")
+    record.setdefault("latest_action", "initial_scan")
+    record.setdefault("last_error", "")
+    record.setdefault("created_at", now_ts())
+    record.setdefault("updated_at", now_ts())
+    record.setdefault("history", [])
+    record.setdefault("cached_content", {})
+    record.setdefault("automation", {"enabled": True, "completed": []})
+    record.setdefault("shell_probe", {"status": "unknown", "message": ""})
+    record.setdefault("proxy", "")
+    record.setdefault("runtime_proxy", "")
+    record.setdefault("runtime_proxy_file", "")
+    return record
+
+
+def persist_record_metadata(record):
+    scan_root = (record or {}).get("scan_root")
+    root_task_id = (record or {}).get("root_task_id")
+    if not scan_root or not root_task_id:
+        return
+    payload = {
+        "root_task_id": root_task_id,
+        "active_task_id": record.get("active_task_id", root_task_id),
+        "domain": record.get("domain", ""),
+        "vuln_id": record.get("vuln_id", ""),
+        "request_file": record.get("request_file", ""),
+        "scan_root": scan_root,
+        "force_ssl": bool(record.get("force_ssl", False)),
+        "status": record.get("status", "queued"),
+        "phase": record.get("phase", "queued"),
+        "latest_action": record.get("latest_action", "initial_scan"),
+        "last_error": record.get("last_error", ""),
+        "created_at": int(record.get("created_at") or now_ts()),
+        "updated_at": int(record.get("updated_at") or now_ts()),
+        "history": record.get("history", []),
+        "automation": record.get("automation", {"enabled": True, "completed": []}),
+        "shell_probe": record.get("shell_probe", {"status": "unknown", "message": ""}),
+        "proxy": record.get("proxy", ""),
+        "runtime_proxy": record.get("runtime_proxy", ""),
+        "runtime_proxy_file": record.get("runtime_proxy_file", ""),
+    }
+    path = metadata_file_path(scan_root)
+    temp_path = f"{path}.tmp"
+    try:
+        os.makedirs(scan_root, exist_ok=True)
+        with open(temp_path, "wt", encoding="utf8", newline="\n") as file_handle:
+            json.dump(payload, file_handle, ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
+    except Exception:
+        pass
+
+
+def recover_scan_records():
+    scans_root = os.path.join(OUTPUT_DIR, "scans")
+    if not os.path.isdir(scans_root):
+        return
+    for entry in os.listdir(scans_root):
+        scan_root = os.path.join(scans_root, entry)
+        if not os.path.isdir(scan_root):
+            continue
+        meta_path = metadata_file_path(scan_root)
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path, "rt", encoding="utf8") as file_handle:
+                payload = json.load(file_handle)
+        except Exception:
+            continue
+        root_task_id = str(payload.get("root_task_id") or "").strip()
+        if not root_task_id:
+            continue
+        payload["scan_root"] = payload.get("scan_root") or scan_root
+        payload["request_file"] = payload.get("request_file") or os.path.join(payload["scan_root"], "request.txt")
+        scan_records[root_task_id] = record_defaults(payload)
+
+
 def sanitize_path_component(value):
     result = []
     for char in value or "":
@@ -186,7 +271,8 @@ def require_auth(func):
 
 
 def create_record(root_task_id, domain, vuln_id, request_file, scan_root, force_ssl):
-    record = {
+    record = record_defaults(
+        {
         "root_task_id": root_task_id,
         "active_task_id": root_task_id,
         "domain": domain,
@@ -214,8 +300,31 @@ def create_record(root_task_id, domain, vuln_id, request_file, scan_root, force_
         "runtime_proxy": "",
         "runtime_proxy_file": "",
     }
+    )
     scan_records[root_task_id] = record
+    persist_record_metadata(record)
     return record
+
+
+def find_shared_record_by_domain(domain, proxy, force_ssl):
+    domain = (domain or "").strip().lower()
+    if not domain:
+        return None
+    proxy = (proxy or "").strip()
+    target = None
+    target_ts = -1
+    for record in scan_records.values():
+        if (record.get("domain") or "").strip().lower() != domain:
+            continue
+        if bool(record.get("force_ssl", False)) != bool(force_ssl):
+            continue
+        if (record.get("proxy") or "").strip() != proxy:
+            continue
+        ts = int(record.get("updated_at") or 0)
+        if ts > target_ts:
+            target_ts = ts
+            target = record
+    return target
 
 
 def queue_job(root_task_id, sqlmap_task_id, scan_data, action, action_args=None):
@@ -242,6 +351,7 @@ def queue_job(root_task_id, sqlmap_task_id, scan_data, action, action_args=None)
         record["phase"] = f"queued:{action}"
         record["latest_action"] = action
         record["updated_at"] = now_ts()
+        persist_record_metadata(record)
 
     process_next_in_queue()
     queued = root_task_id not in running_tasks
@@ -268,6 +378,7 @@ def process_next_in_queue():
                 record["latest_action"] = job["action"]
                 record["active_task_id"] = job["sqlmap_task_id"]
                 record["updated_at"] = now_ts()
+                persist_record_metadata(record)
             started_jobs.append(job)
 
     for job in started_jobs:
@@ -301,6 +412,7 @@ def start_sqlmap_task(job):
                         record["status"] = status
                         record["phase"] = derive_phase(record, action)
                         record["updated_at"] = now_ts()
+                        persist_record_metadata(record)
                 if status in ("terminated", "not running"):
                     break
                 time.sleep(DEFAULT_POLL_SECONDS)
@@ -349,6 +461,7 @@ def finalize_job(root_task_id, sqlmap_task_id, action, error_message, return_cod
             record["last_error"] = f"Enumeration returned empty result, retrying with {profile.get('label')}"
         elif action not in record["automation"]["completed"]:
             record["automation"]["completed"].append(action)
+        persist_record_metadata(record)
 
     with queue_lock:
         if root_task_id in running_tasks:
@@ -511,11 +624,90 @@ def normalize_techniques(raw_value):
     return techniques
 
 
+def normalize_current_db(raw_value):
+    if isinstance(raw_value, str):
+        value = raw_value.strip()
+        return value if value else ""
+    if isinstance(raw_value, list):
+        for item in raw_value:
+            value = normalize_current_db(item)
+            if value:
+                return value
+    if isinstance(raw_value, dict):
+        for value in raw_value.values():
+            parsed = normalize_current_db(value)
+            if parsed:
+                return parsed
+    return ""
+
+
+def normalize_dbs(raw_value):
+    values = []
+    if isinstance(raw_value, str):
+        value = raw_value.strip()
+        if value:
+            values.append(value)
+    elif isinstance(raw_value, list):
+        for item in raw_value:
+            values.extend(normalize_dbs(item))
+    elif isinstance(raw_value, dict):
+        for value in raw_value.values():
+            values.extend(normalize_dbs(value))
+    dedup = []
+    seen = set()
+    for item in values:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(item)
+    return dedup
+
+
+def normalize_tables(raw_value):
+    if isinstance(raw_value, dict):
+        out = {}
+        for db_name, table_values in raw_value.items():
+            db_key = str(db_name or "").strip()
+            if not db_key:
+                continue
+            out[db_key] = normalize_dbs(table_values)
+        return out
+    return {}
+
+
+def normalize_columns(raw_value):
+    if not isinstance(raw_value, dict):
+        return {}
+    out = {}
+    for db_name, table_map in raw_value.items():
+        db_key = str(db_name or "").strip()
+        if not db_key or not isinstance(table_map, dict):
+            continue
+        out[db_key] = {}
+        for table_name, column_map in table_map.items():
+            table_key = str(table_name or "").strip()
+            if not table_key:
+                continue
+            if isinstance(column_map, dict):
+                out[db_key][table_key] = dict(column_map)
+            elif isinstance(column_map, list):
+                out[db_key][table_key] = {str(name): "" for name in normalize_dbs(column_map)}
+    return out
+
+
 def normalize_scan_data(data_rows):
     by_type = {}
     for item in data_rows or []:
         type_name = CONTENT_TYPE_NAMES.get(item.get("type"), f"type_{item.get('type')}")
         by_type[type_name] = item.get("value")
+
+    current_db = normalize_current_db(by_type.get("current_db"))
+    dbs = normalize_dbs(by_type.get("dbs"))
+    tables = normalize_tables(by_type.get("tables"))
+    columns = normalize_columns(by_type.get("columns"))
+    if current_db and current_db not in dbs:
+        dbs = [current_db] + dbs
 
     return {
         "target": by_type.get("target"),
@@ -523,12 +715,12 @@ def normalize_scan_data(data_rows):
         "dbms_fingerprint": by_type.get("dbms_fingerprint"),
         "banner": by_type.get("banner"),
         "current_user": by_type.get("current_user"),
-        "current_db": by_type.get("current_db"),
+        "current_db": current_db,
         "hostname": by_type.get("hostname"),
         "is_dba": by_type.get("is_dba"),
-        "dbs": by_type.get("dbs"),
-        "tables": by_type.get("tables"),
-        "columns": by_type.get("columns"),
+        "dbs": dbs,
+        "tables": tables,
+        "columns": columns,
         "count": by_type.get("count"),
         "dump_table": by_type.get("dump_table"),
         "os_cmd": by_type.get("os_cmd"),
@@ -584,6 +776,15 @@ def build_tree(content, dump_files):
                 "rows": [],
             }
         return database["_table_map"][table_name]
+
+    dbs = content.get("dbs")
+    if isinstance(dbs, list):
+        for db_name in dbs:
+            if isinstance(db_name, str) and db_name.strip():
+                ensure_database(db_name.strip())
+    current_db = content.get("current_db")
+    if isinstance(current_db, str) and current_db.strip():
+        ensure_database(current_db.strip())
 
     tables = content.get("tables")
     if isinstance(tables, dict):
@@ -778,7 +979,7 @@ def build_scan_snapshot(root_task_id, include_logs=True):
         "session": session_state,
         "dump_files": dump_files,
         "errors": [item[0] if isinstance(item, list) else item for item in data_res.get("error", [])],
-        "logs": logs_res.get("log", [])[-100:],
+        "logs": logs_res.get("log", []),
         "history": record.get("history", []),
         "automation": record.get("automation", {}),
         "shell_probe": record.get("shell_probe", {}),
@@ -968,6 +1169,7 @@ def refresh_runtime_proxy(root_task_id):
         runtime_proxy = parsed.get("proxy", "") or ""
     record["runtime_proxy"] = runtime_proxy
     record["runtime_proxy_file"] = cfg_file
+    persist_record_metadata(record)
 
 
 def build_follow_up_options(record, action, action_args):
@@ -1028,6 +1230,16 @@ def build_follow_up_options(record, action, action_args):
             base["db"] = action_args["db"]
         if action_args.get("table"):
             base["tbl"] = action_args["table"]
+    elif action == "search_column":
+        base["search"] = True
+        if action_args.get("db"):
+            base["db"] = action_args["db"]
+        if action_args.get("table"):
+            base["tbl"] = action_args["table"]
+        column_name = str(action_args.get("column") or "").strip()
+        if not column_name:
+            raise ValueError("column is required for search_column")
+        base["col"] = column_name
     elif action == "probe_shell":
         base["osCmd"] = action_args.get("command") or "echo sqlmap"
     else:
@@ -1154,9 +1366,28 @@ def start_scan():
     request_data = data.get("request_data")
     force_ssl = bool(data.get("force_ssl", False))
     proxy = data.get("proxy") or ""
+    share_by_domain = data.get("share_by_domain", True)
+    if isinstance(share_by_domain, str):
+        share_by_domain = share_by_domain.strip().lower() not in ("0", "false", "no")
+    else:
+        share_by_domain = bool(share_by_domain)
 
     if not all([domain, vuln_id, request_data]):
         return jsonify({"error": "Missing required fields"}), 400
+
+    if share_by_domain:
+        shared = find_shared_record_by_domain(domain, proxy, force_ssl)
+        if shared:
+            shared["updated_at"] = now_ts()
+            persist_record_metadata(shared)
+            return jsonify(
+                {
+                    "message": "Reused existing domain scan",
+                    "task_id": shared["root_task_id"],
+                    "shared": True,
+                    "domain": domain,
+                }
+            ), 200
 
     scan_name = sanitize_path_component(f"{domain}.{vuln_id}")
     scan_root = os.path.join(OUTPUT_DIR, "scans", scan_name)
@@ -1168,6 +1399,7 @@ def start_scan():
     root_task_id = create_follow_up_sqlmap_task()
     record = create_record(root_task_id, domain, vuln_id, request_file, scan_root, force_ssl)
     record["proxy"] = proxy
+    persist_record_metadata(record)
     scan_data = build_follow_up_options(scan_records[root_task_id], "initial_scan", {})
     ok, message, _ = queue_job(root_task_id, root_task_id, scan_data, "initial_scan")
     status_code = 202 if message == "Task queued" else 200
@@ -1194,7 +1426,7 @@ def run_action(root_task_id):
 
     data = request.json or {}
     action = data.get("action")
-    if action not in ("get_current_db", "get_dbs", "get_tables", "get_columns", "dump_first_row", "dump_table_data", "probe_shell"):
+    if action not in ("get_current_db", "get_dbs", "get_tables", "get_columns", "dump_first_row", "dump_table_data", "search_column", "probe_shell"):
         return jsonify({"error": "Unsupported action"}), 400
 
     snapshot = build_scan_snapshot(root_task_id, include_logs=False)
@@ -1202,6 +1434,7 @@ def run_action(root_task_id):
         "db": data.get("db") or get_first_database(snapshot),
         "table": data.get("table") or get_first_table(snapshot, data.get("db") or get_first_database(snapshot)),
         "command": data.get("command"),
+        "column": data.get("column"),
         "limit_start": data.get("limit_start"),
         "limit_stop": data.get("limit_stop"),
     }
@@ -1240,6 +1473,7 @@ def update_scan_proxy(root_task_id):
     proxy = (data.get("proxy") or "").strip()
     record["proxy"] = proxy
     refresh_runtime_proxy(root_task_id)
+    persist_record_metadata(record)
     return jsonify(
         {
             "message": "proxy updated",
@@ -1267,6 +1501,8 @@ def update_scan_request(root_task_id):
     os.makedirs(os.path.dirname(os.path.abspath(request_file)), exist_ok=True)
     with open(request_file, "wt", encoding="utf8", newline="") as file_handle:
         file_handle.write(request_content)
+    record["updated_at"] = now_ts()
+    persist_record_metadata(record)
     return jsonify(
         {
             "message": "request updated",
@@ -1294,4 +1530,5 @@ def get_data(root_task_id):
 
 
 if __name__ == "__main__":
+    recover_scan_records()
     app.run(host="0.0.0.0", port=FLASK_PORT)
