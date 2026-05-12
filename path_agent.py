@@ -37,8 +37,29 @@ REQUEST_TIMEOUT = 12
 MAX_FETCH_URLS = 200
 LOG_RETENTION_LINES = 2000
 LOG_RESPONSE_LIMIT = 200
-KATANA_SEED_LIMIT = 20
 KATANA_SEED_STATUS_CODES = {200, 201, 202, 204, 301, 302, 307, 308, 401, 403}
+DEFAULT_KATANA_SEED_MODE = "auto"
+KATANA_SEED_MODE_LIMITS = {
+    "auto": 20,
+    "20": 20,
+    "50": 50,
+    "100": 100,
+    "unlimited": 0,
+}
+KATANA_PRIORITY_KEYWORDS = [
+    "admin",
+    "administrator",
+    "root",
+    "manager",
+    "adm",
+    "panel",
+    "login",
+    "dashboard",
+    "backend",
+    "console",
+    "control",
+    "manage",
+]
 AGENT_VERSION = "2.2.1"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 PYTHON_BIN = os.getenv("PATH_AGENT_PYTHON", sys.executable or "python3")
@@ -82,6 +103,11 @@ def normalize_target_url(raw_url):
     return f"{scheme}://{parsed.hostname}/"
 
 
+def normalize_katana_seed_mode(value):
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in KATANA_SEED_MODE_LIMITS else DEFAULT_KATANA_SEED_MODE
+
+
 def make_scan_snapshot(record):
     if not record:
         return {"error": "Task not found"}
@@ -97,6 +123,7 @@ def make_scan_snapshot(record):
         "updated_at": int(record.get("updated_at") or 0),
         "completed_at": int(record.get("completed_at") or 0),
         "log_count": int(record.get("log_cursor") or 0),
+        "katana_seed_mode": record.get("katana_seed_mode", DEFAULT_KATANA_SEED_MODE),
         "queued": record["task_id"] not in running_tasks and any(item == record["task_id"] for item in list(task_queue.queue)),
         "running": record["task_id"] in running_tasks,
         "result": record.get("result"),
@@ -130,7 +157,7 @@ def make_log_snapshot(record, offset=0, limit=LOG_RESPONSE_LIMIT):
     }
 
 
-def create_record(target_url, panel_task_id):
+def create_record(target_url, panel_task_id, katana_seed_mode=DEFAULT_KATANA_SEED_MODE):
     task_id = uuid.uuid4().hex
     scan_root = os.path.join(OUTPUT_DIR, "scans", task_id)
     os.makedirs(scan_root, exist_ok=True)
@@ -138,6 +165,7 @@ def create_record(target_url, panel_task_id):
         "task_id": task_id,
         "panel_task_id": panel_task_id,
         "target_url": target_url,
+        "katana_seed_mode": normalize_katana_seed_mode(katana_seed_mode),
         "scan_root": scan_root,
         "status": "queued",
         "paths_count": 0,
@@ -450,9 +478,63 @@ def merge_path_item(existing, details, source):
     return item
 
 
+def katana_seed_status_priority(status_code):
+    status = int(status_code or 0)
+    if status == 200:
+        return 40
+    if status in {201, 202, 204}:
+        return 32
+    if status in {301, 302, 307, 308}:
+        return 28
+    if status in {401, 403}:
+        return 20
+    return 0
+
+
+def katana_seed_keyword_score(candidate_url):
+    parsed = urlparse(candidate_url or "")
+    haystack = f"{parsed.path or '/'} {parsed.query or ''}".lower()
+    score = 0
+    for keyword in KATANA_PRIORITY_KEYWORDS:
+        if f"/{keyword}" in haystack or f"-{keyword}" in haystack or f"_{keyword}" in haystack:
+            score += 120
+        elif keyword in haystack:
+            score += 60
+    return score
+
+
+def build_katana_seed_list(target_url, dirsearch_results):
+    deduped = []
+    seen_seed_urls = set()
+    for item in dirsearch_results:
+        candidate_url = normalize_same_host_url(target_url, item.get("url"))
+        if not candidate_url:
+            continue
+        if int(item.get("status_code") or 0) not in KATANA_SEED_STATUS_CODES:
+            continue
+        if candidate_url in seen_seed_urls:
+            continue
+        seen_seed_urls.add(candidate_url)
+        deduped.append(item)
+    ranked = sorted(
+        deduped,
+        key=lambda item: (
+            -katana_seed_keyword_score(item.get("url")),
+            -katana_seed_status_priority(item.get("status_code")),
+            item.get("url") or "",
+        ),
+    )
+    return [
+        normalize_same_host_url(target_url, item.get("url"))
+        for item in ranked
+        if normalize_same_host_url(target_url, item.get("url"))
+    ]
+
+
 def run_scan_pipeline(record):
     target_url = record["target_url"]
     scan_root = record["scan_root"]
+    katana_seed_mode = normalize_katana_seed_mode(record.get("katana_seed_mode"))
     candidates = {}
     pending = queue.Queue()
     processed = set()
@@ -478,22 +560,13 @@ def run_scan_pipeline(record):
         path_map[item.get("url")] = merge_path_item(existing, item, item.get("source") or "dirsearch")
     for item in run_katana(target_url, scan_root, record):
         push_candidate(item.get("url"), item.get("source") or "katana")
-    katana_seeds = []
-    seen_seed_urls = set()
-    for item in dirsearch_results:
-        candidate_url = normalize_same_host_url(target_url, item.get("url"))
-        if not candidate_url:
-            continue
-        if int(item.get("status_code") or 0) not in KATANA_SEED_STATUS_CODES:
-            continue
-        if candidate_url in seen_seed_urls:
-            continue
-        seen_seed_urls.add(candidate_url)
-        katana_seeds.append(candidate_url)
-        if len(katana_seeds) >= KATANA_SEED_LIMIT:
-            break
+    all_katana_seeds = build_katana_seed_list(target_url, dirsearch_results)
+    katana_seed_limit = int(KATANA_SEED_MODE_LIMITS.get(katana_seed_mode, KATANA_SEED_MODE_LIMITS[DEFAULT_KATANA_SEED_MODE]))
+    katana_seeds = all_katana_seeds if katana_seed_limit <= 0 else all_katana_seeds[:katana_seed_limit]
     if katana_seeds:
-        append_log(record, f"[katana-seed] queued {len(katana_seeds)} dirsearch-discovered seeds")
+        append_log(record, f"[katana-seed] mode={katana_seed_mode} queued {len(katana_seeds)} of {len(all_katana_seeds)} dirsearch-discovered seeds")
+    if katana_seed_limit > 0 and len(all_katana_seeds) > len(katana_seeds):
+        append_log(record, f"[katana-seed] truncated {len(all_katana_seeds) - len(katana_seeds)} lower-priority seeds")
     for idx, seed_url in enumerate(katana_seeds, start=1):
         append_log(record, f"[katana-seed] {idx}/{len(katana_seeds)} {seed_url}")
         for item in run_katana(seed_url, scan_root, record, output_name=f"katana-seed-{idx}.txt", stage_name=f"katana-seed-{idx}"):
@@ -598,8 +671,10 @@ def start_scan():
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
     panel_task_id = data.get("task_id")
-    record = create_record(target_url, panel_task_id)
+    katana_seed_mode = normalize_katana_seed_mode(data.get("katana_seed_mode"))
+    record = create_record(target_url, panel_task_id, katana_seed_mode)
     append_log(record, f"[queue] task created for {target_url}")
+    append_log(record, f"[queue] katana seed mode: {katana_seed_mode}")
     task_queue.put(record["task_id"])
     append_log(record, "[queue] task queued")
     return jsonify({"message": "Task queued", "task_id": record["task_id"]}), 202
