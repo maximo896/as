@@ -190,7 +190,7 @@ def run_dirsearch(target_url, scan_root):
         "-u",
         target_url,
         "-w",
-        "/opt/dirsearch/db/dicc.txt",
+        "/opt/wordlists/path-default.txt",
         "--format=json",
         "-o",
         output_path,
