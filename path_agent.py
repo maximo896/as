@@ -6,6 +6,7 @@ import queue
 import re
 import secrets
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -38,6 +39,7 @@ LOG_RETENTION_LINES = 2000
 LOG_RESPONSE_LIMIT = 200
 AGENT_VERSION = "2.2.1"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+PYTHON_BIN = os.getenv("PATH_AGENT_PYTHON", sys.executable or "python3")
 
 http_session = requests.Session()
 http_session.headers.update({"User-Agent": USER_AGENT})
@@ -266,7 +268,7 @@ def run_dirsearch(target_url, scan_root, record):
     output_path = os.path.join(scan_root, "dirsearch.json")
     log_path = os.path.join(scan_root, "dirsearch.log")
     cmd = [
-        "python3",
+        PYTHON_BIN,
         "/opt/dirsearch/dirsearch.py",
         "-u",
         target_url,
