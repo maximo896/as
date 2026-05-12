@@ -807,6 +807,19 @@ def build_tree(content, dump_files):
                     table["column_types"] = column_map
                     table["columns"] = sorted(column_map.keys())
 
+    counts = content.get("count")
+    if isinstance(counts, dict):
+        for db_name, table_map in counts.items():
+            database = ensure_database(db_name)
+            if not isinstance(table_map, dict):
+                continue
+            for table_name, count_value in table_map.items():
+                table = ensure_table(database, table_name)
+                try:
+                    table["row_count"] = int(count_value)
+                except Exception:
+                    table["row_count"] = count_value
+
     for dump_file in dump_files or []:
         database = ensure_database(dump_file.get("database"))
         preview = dump_file.get("preview", {})
@@ -840,26 +853,31 @@ def build_tree(content, dump_files):
     return tree
 
 
-def build_search_results(tree, term):
+def build_search_results(tree, term, kind_filter=""):
     results = []
     needle = (term or "").strip().lower()
+    kind_filter = (kind_filter or "").strip().lower()
     if not needle:
         return results
 
+    def include(kind_name):
+        return not kind_filter or kind_filter == kind_name
+
     for database in tree.get("databases", []):
         db_name = database.get("name", "")
-        if needle in db_name.lower():
+        if include("database") and needle in db_name.lower():
             results.append({"kind": "database", "database": db_name, "table": "", "column": "", "value": db_name})
         for table in database.get("tables", []):
             table_name = table.get("name", "")
-            if needle in table_name.lower():
+            if include("table") and needle in table_name.lower():
                 results.append({"kind": "table", "database": db_name, "table": table_name, "column": "", "value": table_name})
             for column in table.get("columns", []):
                 if needle in str(column).lower():
-                    results.append({"kind": "column", "database": db_name, "table": table_name, "column": column, "value": column})
+                    if include("column"):
+                        results.append({"kind": "column", "database": db_name, "table": table_name, "column": column, "value": column})
             for row in table.get("rows", []):
                 for column_name, column_value in row.items():
-                    if needle in str(column_value).lower():
+                    if include("data") and needle in str(column_value).lower():
                         results.append(
                             {
                                 "kind": "data",
@@ -1231,6 +1249,12 @@ def build_follow_up_options(record, action, action_args):
             base["db"] = action_args["db"]
         if action_args.get("table"):
             base["tbl"] = action_args["table"]
+    elif action == "count_rows":
+        base["count"] = True
+        if action_args.get("db"):
+            base["db"] = action_args["db"]
+        if action_args.get("table"):
+            base["tbl"] = action_args["table"]
     elif action == "search_column":
         base["search"] = True
         if action_args.get("db"):
@@ -1241,6 +1265,29 @@ def build_follow_up_options(record, action, action_args):
         if not column_name:
             raise ValueError("column is required for search_column")
         base["col"] = column_name
+    elif action == "search":
+        base["search"] = True
+        search_kind = str(action_args.get("search_kind") or "").strip().lower()
+        search_query = str(action_args.get("search_query") or "").strip()
+        if not search_query:
+            raise ValueError("search_query is required for search")
+        if search_kind == "database":
+            base["db"] = search_query
+        elif search_kind == "table":
+            base["tbl"] = search_query
+            if action_args.get("db"):
+                base["db"] = action_args["db"]
+        elif search_kind == "column":
+            base["col"] = search_query
+            if action_args.get("db"):
+                base["db"] = action_args["db"]
+            if action_args.get("table"):
+                base["tbl"] = action_args["table"]
+        elif search_kind == "data":
+            base["search"] = False
+            raise ValueError("data search is not supported by sqlmap --search")
+        else:
+            raise ValueError("unsupported search_kind")
     elif action == "probe_shell":
         base["osCmd"] = action_args.get("command") or "echo sqlmap"
     else:
@@ -1398,7 +1445,7 @@ def run_action(root_task_id):
 
     data = request.json or {}
     action = data.get("action")
-    if action not in ("get_current_db", "get_dbs", "get_tables", "get_columns", "dump_first_row", "dump_table_data", "search_column", "probe_shell"):
+    if action not in ("get_current_db", "get_dbs", "get_tables", "get_columns", "dump_first_row", "dump_table_data", "search_column", "probe_shell", "search", "count_rows"):
         return jsonify({"error": "Unsupported action"}), 400
 
     snapshot = build_scan_snapshot(root_task_id, include_logs=False)
@@ -1407,6 +1454,8 @@ def run_action(root_task_id):
         "table": data.get("table") or get_first_table(snapshot, data.get("db") or get_first_database(snapshot)),
         "command": data.get("command"),
         "column": data.get("column"),
+        "search_kind": data.get("search_kind"),
+        "search_query": data.get("search_query"),
         "limit_start": data.get("limit_start"),
         "limit_stop": data.get("limit_stop"),
     }
@@ -1431,8 +1480,9 @@ def search_scan(root_task_id):
     if snapshot.get("error"):
         return jsonify(snapshot), 404
     query = request.args.get("q", "")
-    results = build_search_results(snapshot.get("tree", {}), query)
-    return jsonify({"task_id": root_task_id, "query": query, "results": results})
+    kind = request.args.get("kind", "")
+    results = build_search_results(snapshot.get("tree", {}), query, kind)
+    return jsonify({"task_id": root_task_id, "query": query, "kind": kind, "results": results})
 
 
 @app.route("/scan/<root_task_id>/proxy", methods=["PUT"])

@@ -34,7 +34,9 @@ FLASK_PORT = args.flask_port or int(os.getenv("FLASK_PORT", "5000"))
 MAX_CONCURRENT_SCANS = args.max_concurrent or int(os.getenv("MAX_CONCURRENT_SCANS", "5"))
 REQUEST_TIMEOUT = 12
 MAX_FETCH_URLS = 200
-AGENT_VERSION = "2.2.0"
+LOG_RETENTION_LINES = 2000
+LOG_RESPONSE_LIMIT = 200
+AGENT_VERSION = "2.2.1"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 http_session = requests.Session()
@@ -89,9 +91,38 @@ def make_scan_snapshot(record):
         "last_error": record.get("last_error", ""),
         "created_at": int(record.get("created_at") or 0),
         "updated_at": int(record.get("updated_at") or 0),
+        "completed_at": int(record.get("completed_at") or 0),
+        "log_count": int(record.get("log_cursor") or 0),
         "queued": record["task_id"] not in running_tasks and any(item == record["task_id"] for item in list(task_queue.queue)),
         "running": record["task_id"] in running_tasks,
         "result": record.get("result"),
+    }
+
+
+def make_log_snapshot(record, offset=0, limit=LOG_RESPONSE_LIMIT):
+    if not record:
+        return {"error": "Task not found"}
+    safe_offset = max(0, int(offset or 0))
+    safe_limit = max(1, min(int(limit or LOG_RESPONSE_LIMIT), 1000))
+    logs = list(record.get("logs") or [])
+    total = int(record.get("log_cursor") or 0)
+    first_offset = logs[0]["offset"] if logs else total + 1
+    truncated = bool(logs) and safe_offset < first_offset - 1
+    entries = [entry for entry in logs if int(entry.get("offset") or 0) > safe_offset]
+    entries = entries[:safe_limit]
+    next_offset = safe_offset
+    if entries:
+        next_offset = int(entries[-1].get("offset") or safe_offset)
+    return {
+        "task_id": record["task_id"],
+        "status": record.get("status"),
+        "running": record["task_id"] in running_tasks,
+        "queued": record["task_id"] not in running_tasks and any(item == record["task_id"] for item in list(task_queue.queue)),
+        "entries": entries,
+        "next_offset": next_offset,
+        "total": total,
+        "truncated": truncated,
+        "completed_at": int(record.get("completed_at") or 0),
     }
 
 
@@ -110,6 +141,9 @@ def create_record(target_url, panel_task_id):
         "last_error": "",
         "created_at": now_ts(),
         "updated_at": now_ts(),
+        "completed_at": 0,
+        "log_cursor": 0,
+        "logs": [],
         "result": {
             "target_url": target_url,
             "paths": [],
@@ -120,23 +154,70 @@ def create_record(target_url, panel_task_id):
     return record
 
 
+def append_log(record, message):
+    text = " ".join(str(message or "").strip().split())
+    if not text:
+        return
+    with record_lock:
+        next_offset = int(record.get("log_cursor") or 0) + 1
+        logs = record.setdefault("logs", [])
+        logs.append(
+            {
+                "offset": next_offset,
+                "timestamp": now_ts(),
+                "message": text,
+            }
+        )
+        record["log_cursor"] = next_offset
+        if len(logs) > LOG_RETENTION_LINES:
+            del logs[: len(logs) - LOG_RETENTION_LINES]
+        record["updated_at"] = now_ts()
+
+
 def write_json(path, payload):
     with open(path, "wt", encoding="utf8", newline="\n") as file_handle:
         json.dump(payload, file_handle, ensure_ascii=False, indent=2)
 
 
-def run_command(cmd, cwd, stdout_path, timeout):
+def run_command(cmd, cwd, stdout_path, timeout, record, stage_name):
+    append_log(record, f"[{stage_name}] start: {' '.join(cmd)}")
+    started_at = time.time()
     with open(stdout_path, "wt", encoding="utf8", newline="\n") as output_handle:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=cwd,
-            stdout=output_handle,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=timeout,
-            check=False,
+            bufsize=1,
         )
-    return proc.returncode
+        try:
+            while True:
+                if timeout and (time.time() - started_at) > timeout:
+                    proc.kill()
+                    append_log(record, f"[{stage_name}] timeout after {timeout}s")
+                    raise TimeoutError(f"{stage_name} timed out after {timeout}s")
+                line = proc.stdout.readline()
+                if line:
+                    output_handle.write(line)
+                    output_handle.flush()
+                    append_log(record, f"[{stage_name}] {line.rstrip()}")
+                    continue
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+            tail = proc.stdout.read() if proc.stdout else ""
+            if tail:
+                output_handle.write(tail)
+                output_handle.flush()
+                for line in tail.splitlines():
+                    append_log(record, f"[{stage_name}] {line.rstrip()}")
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+        return_code = proc.wait()
+    append_log(record, f"[{stage_name}] exit code: {return_code}")
+    return return_code
 
 
 def parse_dirsearch_results(result_path, target_url):
@@ -181,7 +262,7 @@ def parse_dirsearch_results(result_path, target_url):
     return results
 
 
-def run_dirsearch(target_url, scan_root):
+def run_dirsearch(target_url, scan_root, record):
     output_path = os.path.join(scan_root, "dirsearch.json")
     log_path = os.path.join(scan_root, "dirsearch.log")
     cmd = [
@@ -198,18 +279,22 @@ def run_dirsearch(target_url, scan_root):
         "--random-agent",
     ]
     try:
-        run_command(cmd, "/opt/dirsearch", log_path, 900)
-    except Exception:
+        run_command(cmd, "/opt/dirsearch", log_path, 900, record, "dirsearch")
+    except Exception as exc:
+        append_log(record, f"[dirsearch] failed: {exc}")
         return []
-    return parse_dirsearch_results(output_path, target_url)
+    results = parse_dirsearch_results(output_path, target_url)
+    append_log(record, f"[dirsearch] discovered {len(results)} candidate paths")
+    return results
 
 
-def run_katana(target_url, scan_root):
+def run_katana(target_url, scan_root, record):
     output_path = os.path.join(scan_root, "katana.txt")
     cmd = ["/usr/local/bin/katana", "-u", target_url, "-silent"]
     try:
-        run_command(cmd, scan_root, output_path, 600)
-    except Exception:
+        run_command(cmd, scan_root, output_path, 600, record, "katana")
+    except Exception as exc:
+        append_log(record, f"[katana] failed: {exc}")
         return []
     results = []
     if not os.path.isfile(output_path):
@@ -220,8 +305,10 @@ def run_katana(target_url, scan_root):
                 candidate = line.strip()
                 if candidate.startswith("http://") or candidate.startswith("https://"):
                     results.append({"url": candidate, "source": "katana"})
-    except Exception:
+    except Exception as exc:
+        append_log(record, f"[katana] parse failed: {exc}")
         return []
+    append_log(record, f"[katana] discovered {len(results)} candidate URLs")
     return results
 
 
@@ -377,12 +464,14 @@ def run_scan_pipeline(record):
         if normalized not in processed:
             pending.put(normalized)
 
+    append_log(record, f"[scan] start target={target_url}")
     push_candidate(target_url, "root")
-    for item in run_dirsearch(target_url, scan_root):
+    append_log(record, "[scan] root URL queued")
+    for item in run_dirsearch(target_url, scan_root, record):
         push_candidate(item.get("url"), item.get("source") or "dirsearch")
         existing = path_map.get(item.get("url"))
         path_map[item.get("url")] = merge_path_item(existing, item, item.get("source") or "dirsearch")
-    for item in run_katana(target_url, scan_root):
+    for item in run_katana(target_url, scan_root, record):
         push_candidate(item.get("url"), item.get("source") or "katana")
 
     while not pending.empty() and len(processed) < MAX_FETCH_URLS:
@@ -391,6 +480,7 @@ def run_scan_pipeline(record):
             continue
         processed.add(current)
         try:
+            append_log(record, f"[fetch] {len(processed)}/{MAX_FETCH_URLS} {current}")
             details = fetch_url_details(current)
         except Exception:
             details = {
@@ -418,6 +508,7 @@ def run_scan_pipeline(record):
     record["result"] = result
     record["paths_count"] = len(paths)
     record["forms_count"] = forms_count
+    append_log(record, f"[scan] completed with {len(paths)} paths and {forms_count} forms")
     write_json(os.path.join(scan_root, "result.json"), make_scan_snapshot(record))
 
 
@@ -434,13 +525,18 @@ def worker_loop():
         if not record:
             task_queue.task_done()
             continue
+        append_log(record, "[queue] dequeued and running")
         try:
             run_scan_pipeline(record)
             record["status"] = "completed"
             record["last_error"] = ""
+            record["completed_at"] = now_ts()
+            append_log(record, "[queue] task completed")
         except Exception as exc:
             record["status"] = "failed"
             record["last_error"] = str(exc)
+            record["completed_at"] = now_ts()
+            append_log(record, f"[queue] task failed: {exc}")
         finally:
             record["updated_at"] = now_ts()
             write_json(os.path.join(record["scan_root"], "snapshot.json"), make_scan_snapshot(record))
@@ -472,7 +568,9 @@ def start_scan():
         return jsonify({"error": str(exc)}), 400
     panel_task_id = data.get("task_id")
     record = create_record(target_url, panel_task_id)
+    append_log(record, f"[queue] task created for {target_url}")
     task_queue.put(record["task_id"])
+    append_log(record, "[queue] task queued")
     return jsonify({"message": "Task queued", "task_id": record["task_id"]}), 202
 
 
@@ -485,6 +583,19 @@ def get_scan(task_id):
     if snapshot.get("error"):
         return jsonify(snapshot), 404
     return jsonify(snapshot)
+
+
+@app.route("/scan/<task_id>/log", methods=["GET"])
+@require_auth
+def get_scan_log(task_id):
+    offset = request.args.get("offset", default=0, type=int)
+    limit = request.args.get("limit", default=LOG_RESPONSE_LIMIT, type=int)
+    with record_lock:
+        record = scan_records.get(task_id)
+        payload = make_log_snapshot(record, offset=offset, limit=limit)
+    if payload.get("error"):
+        return jsonify(payload), 404
+    return jsonify(payload)
 
 
 def start_workers():
