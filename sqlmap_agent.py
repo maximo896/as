@@ -37,7 +37,7 @@ DEFAULT_SQLMAP_RISK = 3
 DEFAULT_SQLMAP_THREADS = 4
 DEFAULT_SQLMAP_TIMEOUT = 20
 DEFAULT_SQLMAP_RETRIES = 4
-AGENT_VERSION = "2.1.0"
+AGENT_VERSION = "2.1.2"
 
 ENUM_ACTIONS = {
     "get_current_db",
@@ -1357,28 +1357,9 @@ def start_scan():
     request_data = data.get("request_data")
     force_ssl = bool(data.get("force_ssl", False))
     proxy = data.get("proxy") or ""
-    share_by_domain = data.get("share_by_domain", True)
-    if isinstance(share_by_domain, str):
-        share_by_domain = share_by_domain.strip().lower() not in ("0", "false", "no")
-    else:
-        share_by_domain = bool(share_by_domain)
 
     if not all([domain, vuln_id, request_data]):
         return jsonify({"error": "Missing required fields"}), 400
-
-    if share_by_domain:
-        shared = find_shared_record_by_domain(domain, proxy, force_ssl)
-        if shared:
-            shared["updated_at"] = now_ts()
-            persist_record_metadata(shared)
-            return jsonify(
-                {
-                    "message": "Reused existing domain scan",
-                    "task_id": shared["root_task_id"],
-                    "shared": True,
-                    "domain": domain,
-                }
-            ), 200
 
     scan_name = sanitize_path_component(f"{domain}.{vuln_id}")
     scan_root = os.path.join(OUTPUT_DIR, "scans", scan_name)
