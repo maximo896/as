@@ -266,6 +266,10 @@ def parse_dirsearch_results(result_path, target_url):
     if isinstance(payload, dict):
         if isinstance(payload.get("results"), list):
             entries = payload.get("results", [])
+        elif isinstance(payload.get("results"), dict):
+            for item in payload.get("results", {}).values():
+                if isinstance(item, list):
+                    entries.extend(item)
         elif isinstance(payload.get("data"), dict):
             for item in payload.get("data", {}).values():
                 if isinstance(item, list):
