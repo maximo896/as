@@ -274,9 +274,8 @@ def run_dirsearch(target_url, scan_root, record):
         target_url,
         "-w",
         "/opt/wordlists/path-default.txt",
-        "--format=json",
         "-o",
-        output_path,
+        "--json-report=" + output_path,
         "--quiet-mode",
         "--random-agent",
     ]
