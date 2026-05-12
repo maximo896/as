@@ -37,6 +37,8 @@ REQUEST_TIMEOUT = 12
 MAX_FETCH_URLS = 200
 LOG_RETENTION_LINES = 2000
 LOG_RESPONSE_LIMIT = 200
+KATANA_SEED_LIMIT = 20
+KATANA_SEED_STATUS_CODES = {200, 201, 202, 204, 301, 302, 307, 308, 401, 403}
 AGENT_VERSION = "2.2.1"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 PYTHON_BIN = os.getenv("PATH_AGENT_PYTHON", sys.executable or "python3")
@@ -289,13 +291,13 @@ def run_dirsearch(target_url, scan_root, record):
     return results
 
 
-def run_katana(target_url, scan_root, record):
-    output_path = os.path.join(scan_root, "katana.txt")
+def run_katana(target_url, scan_root, record, output_name="katana.txt", stage_name="katana"):
+    output_path = os.path.join(scan_root, output_name)
     cmd = ["/usr/local/bin/katana", "-u", target_url, "-silent"]
     try:
-        run_command(cmd, scan_root, output_path, 600, record, "katana")
+        run_command(cmd, scan_root, output_path, 600, record, stage_name)
     except Exception as exc:
-        append_log(record, f"[katana] failed: {exc}")
+        append_log(record, f"[{stage_name}] failed: {exc}")
         return []
     results = []
     if not os.path.isfile(output_path):
@@ -307,9 +309,9 @@ def run_katana(target_url, scan_root, record):
                 if candidate.startswith("http://") or candidate.startswith("https://"):
                     results.append({"url": candidate, "source": "katana"})
     except Exception as exc:
-        append_log(record, f"[katana] parse failed: {exc}")
+        append_log(record, f"[{stage_name}] parse failed: {exc}")
         return []
-    append_log(record, f"[katana] discovered {len(results)} candidate URLs")
+    append_log(record, f"[{stage_name}] discovered {len(results)} candidate URLs")
     return results
 
 
@@ -455,6 +457,7 @@ def run_scan_pipeline(record):
     pending = queue.Queue()
     processed = set()
     path_map = {}
+    dirsearch_results = []
 
     def push_candidate(url_value, source):
         normalized = normalize_same_host_url(target_url, url_value)
@@ -469,11 +472,32 @@ def run_scan_pipeline(record):
     push_candidate(target_url, "root")
     append_log(record, "[scan] root URL queued")
     for item in run_dirsearch(target_url, scan_root, record):
+        dirsearch_results.append(item)
         push_candidate(item.get("url"), item.get("source") or "dirsearch")
         existing = path_map.get(item.get("url"))
         path_map[item.get("url")] = merge_path_item(existing, item, item.get("source") or "dirsearch")
     for item in run_katana(target_url, scan_root, record):
         push_candidate(item.get("url"), item.get("source") or "katana")
+    katana_seeds = []
+    seen_seed_urls = set()
+    for item in dirsearch_results:
+        candidate_url = normalize_same_host_url(target_url, item.get("url"))
+        if not candidate_url:
+            continue
+        if int(item.get("status_code") or 0) not in KATANA_SEED_STATUS_CODES:
+            continue
+        if candidate_url in seen_seed_urls:
+            continue
+        seen_seed_urls.add(candidate_url)
+        katana_seeds.append(candidate_url)
+        if len(katana_seeds) >= KATANA_SEED_LIMIT:
+            break
+    if katana_seeds:
+        append_log(record, f"[katana-seed] queued {len(katana_seeds)} dirsearch-discovered seeds")
+    for idx, seed_url in enumerate(katana_seeds, start=1):
+        append_log(record, f"[katana-seed] {idx}/{len(katana_seeds)} {seed_url}")
+        for item in run_katana(seed_url, scan_root, record, output_name=f"katana-seed-{idx}.txt", stage_name=f"katana-seed-{idx}"):
+            push_candidate(item.get("url"), "katana-seed")
 
     while not pending.empty() and len(processed) < MAX_FETCH_URLS:
         current = pending.get()
@@ -497,6 +521,12 @@ def run_scan_pipeline(record):
         for source in sources:
             merged = merge_path_item(merged, details, source)
         path_map[current] = merged
+        final_url = normalize_same_host_url(target_url, details.get("url"))
+        if final_url and final_url != current:
+            push_candidate(final_url, "redirect")
+            redirected = path_map.get(final_url)
+            redirected = merge_path_item(redirected, details, "redirect")
+            path_map[final_url] = redirected
         for js_url in details.get("js_urls", []):
             push_candidate(js_url, "js")
 
