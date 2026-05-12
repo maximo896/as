@@ -1281,21 +1281,10 @@ def build_next_automation_job(root_task_id, snapshot):
     if "get_current_db" not in completed and not current_db:
         return build_automation_job(root_task_id, "get_current_db")
 
-    dbs = snapshot.get("content", {}).get("dbs")
-    if "get_dbs" not in completed and not dbs:
-        return build_automation_job(root_task_id, "get_dbs")
-
-    database_name = get_first_database(snapshot)
+    database_name = current_db or get_first_database(snapshot)
     tables = snapshot.get("content", {}).get("tables")
     if "get_tables" not in completed and database_name and not (isinstance(tables, dict) and tables.get(database_name)):
         return build_automation_job(root_task_id, "get_tables", {"db": database_name})
-
-    table_name = get_first_table(snapshot, database_name)
-    if "get_columns" not in completed and database_name and table_name and not has_columns_for_table(snapshot, database_name, table_name):
-        return build_automation_job(root_task_id, "get_columns", {"db": database_name, "table": table_name})
-
-    if "dump_table_data" not in completed and database_name and table_name and not has_dump_preview(snapshot, database_name, table_name):
-        return build_automation_job(root_task_id, "dump_table_data", {"db": database_name, "table": table_name, "limit_start": 1, "limit_stop": 20})
 
     if "probe_shell" not in completed:
         return build_automation_job(root_task_id, "probe_shell")
