@@ -40,12 +40,13 @@ LOG_RESPONSE_LIMIT = 200
 KATANA_SEED_STATUS_CODES = {200, 201, 202, 204, 301, 302, 307, 308, 401, 403}
 DEFAULT_KATANA_SEED_MODE = "auto"
 KATANA_SEED_MODE_LIMITS = {
-    "auto": 20,
+    "auto": 0,
     "20": 20,
     "50": 50,
     "100": 100,
     "unlimited": 0,
 }
+KATANA_MAX_DEPTH = 3
 KATANA_PRIORITY_KEYWORDS = [
     "admin",
     "administrator",
@@ -323,9 +324,27 @@ def run_dirsearch(target_url, scan_root, record):
     return results
 
 
-def run_katana(target_url, scan_root, record, output_name="katana.txt", stage_name="katana"):
+def run_katana(target_urls, scan_root, record, output_name="katana.txt", stage_name="katana"):
     output_path = os.path.join(scan_root, output_name)
-    cmd = ["/usr/local/bin/katana", "-u", target_url, "-silent"]
+    normalized_targets = []
+    seen_targets = set()
+    for target_url in target_urls if isinstance(target_urls, (list, tuple, set)) else [target_urls]:
+        value = str(target_url or "").strip()
+        if not value or value in seen_targets:
+            continue
+        seen_targets.add(value)
+        normalized_targets.append(value)
+    if not normalized_targets:
+        return []
+    cmd = ["/usr/local/bin/katana", "-silent", "-d", str(KATANA_MAX_DEPTH)]
+    seed_file_path = ""
+    if len(normalized_targets) == 1:
+        cmd.extend(["-u", normalized_targets[0]])
+    else:
+        seed_file_path = os.path.join(scan_root, output_name + ".seeds.txt")
+        with open(seed_file_path, "wt", encoding="utf8", newline="\n") as seed_file:
+            seed_file.write("\n".join(normalized_targets) + "\n")
+        cmd.extend(["-list", seed_file_path])
     try:
         run_command(cmd, scan_root, output_path, 600, record, stage_name)
     except Exception as exc:
@@ -343,7 +362,7 @@ def run_katana(target_url, scan_root, record, output_name="katana.txt", stage_na
     except Exception as exc:
         append_log(record, f"[{stage_name}] parse failed: {exc}")
         return []
-    append_log(record, f"[{stage_name}] discovered {len(results)} candidate URLs")
+    append_log(record, f"[{stage_name}] depth={KATANA_MAX_DEPTH} discovered {len(results)} candidate URLs from {len(normalized_targets)} seed URLs")
     return results
 
 
@@ -558,22 +577,26 @@ def run_scan_pipeline(record):
     push_candidate(target_url, "root")
     append_log(record, "[scan] root URL queued")
     for item in run_dirsearch(target_url, scan_root, record):
+        normalized_item_url = normalize_same_host_url(target_url, item.get("url"))
         dirsearch_results.append(item)
-        push_candidate(item.get("url"), item.get("source") or "dirsearch")
-        existing = path_map.get(item.get("url"))
-        path_map[item.get("url")] = merge_path_item(existing, item, item.get("source") or "dirsearch")
+        push_candidate(normalized_item_url, item.get("source") or "dirsearch")
+        if normalized_item_url:
+            item = dict(item)
+            item["url"] = normalized_item_url
+            existing = path_map.get(normalized_item_url)
+            path_map[normalized_item_url] = merge_path_item(existing, item, item.get("source") or "dirsearch")
     for item in run_katana(target_url, scan_root, record):
         push_candidate(item.get("url"), item.get("source") or "katana")
     all_katana_seeds = build_katana_seed_list(target_url, dirsearch_results)
     katana_seed_limit = int(KATANA_SEED_MODE_LIMITS.get(katana_seed_mode, KATANA_SEED_MODE_LIMITS[DEFAULT_KATANA_SEED_MODE]))
     katana_seeds = all_katana_seeds if katana_seed_limit <= 0 else all_katana_seeds[:katana_seed_limit]
     if katana_seeds:
-        append_log(record, f"[katana-seed] mode={katana_seed_mode} queued {len(katana_seeds)} of {len(all_katana_seeds)} dirsearch-discovered seeds")
+        append_log(record, f"[katana-seed] mode={katana_seed_mode} queued {len(katana_seeds)} of {len(all_katana_seeds)} dirsearch-discovered seeds as a url list")
     if katana_seed_limit > 0 and len(all_katana_seeds) > len(katana_seeds):
         append_log(record, f"[katana-seed] truncated {len(all_katana_seeds) - len(katana_seeds)} lower-priority seeds")
-    for idx, seed_url in enumerate(katana_seeds, start=1):
-        append_log(record, f"[katana-seed] {idx}/{len(katana_seeds)} {seed_url}")
-        for item in run_katana(seed_url, scan_root, record, output_name=f"katana-seed-{idx}.txt", stage_name=f"katana-seed-{idx}"):
+    if katana_seeds:
+        append_log(record, f"[katana-seed] running depth={KATANA_MAX_DEPTH} on full dirsearch seed list")
+        for item in run_katana(katana_seeds, scan_root, record, output_name="katana-seeds.txt", stage_name="katana-seeds"):
             push_candidate(item.get("url"), "katana-seed")
 
     while not pending.empty() and len(processed) < MAX_FETCH_URLS:
