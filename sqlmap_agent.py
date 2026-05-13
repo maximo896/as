@@ -1216,6 +1216,7 @@ def build_follow_up_options(record, action, action_args):
     if action == "initial_scan":
         if action_args.get("technique"):
             base["technique"] = action_args["technique"]
+        base["getCurrentDb"] = True
         return base
     if action == "get_current_db":
         base["getCurrentDb"] = True

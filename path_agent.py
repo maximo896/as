@@ -336,14 +336,22 @@ def run_katana(target_urls, scan_root, record, output_name="katana.txt", stage_n
         normalized_targets.append(value)
     if not normalized_targets:
         return []
-    cmd = ["/usr/local/bin/katana", "-silent", "-d", str(KATANA_MAX_DEPTH)]
+    scope_host = (urlparse(normalized_targets[0]).hostname or "").strip().lower()
+    cmd = ["/usr/local/bin/katana", "-silent", "-d", str(KATANA_MAX_DEPTH), "-fs", "fqdn"]
+    if scope_host:
+        append_log(record, f"[{stage_name}] scope=fqdn host={scope_host}")
     seed_file_path = ""
     if len(normalized_targets) == 1:
+        append_log(record, f"[{stage_name}] mode=single seed_count=1 target={normalized_targets[0]}")
         cmd.extend(["-u", normalized_targets[0]])
     else:
         seed_file_path = os.path.join(scan_root, output_name + ".seeds.txt")
         with open(seed_file_path, "wt", encoding="utf8", newline="\n") as seed_file:
             seed_file.write("\n".join(normalized_targets) + "\n")
+        append_log(
+            record,
+            f"[{stage_name}] mode=list seed_count={len(normalized_targets)} seed_file={os.path.basename(seed_file_path)}",
+        )
         cmd.extend(["-list", seed_file_path])
     try:
         run_command(cmd, scan_root, output_path, 600, record, stage_name)
