@@ -61,7 +61,7 @@ KATANA_PRIORITY_KEYWORDS = [
     "control",
     "manage",
 ]
-AGENT_VERSION = "2.3.3"
+AGENT_VERSION = "2.4.0"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 PYTHON_BIN = os.getenv("PATH_AGENT_PYTHON", sys.executable or "python3")
 
@@ -534,19 +534,42 @@ def katana_seed_keyword_score(candidate_url):
     return score
 
 
-def build_katana_seed_list(target_url, dirsearch_results):
+def build_katana_seed_list(target_url, dirsearch_results, record=None):
     deduped = []
     seen_seed_urls = set()
+    skipped_host_mismatch = 0
+    skipped_status = []
+    skipped_dedup = 0
     for item in dirsearch_results:
-        candidate_url = normalize_same_host_url(target_url, item.get("url"))
+        raw_url = item.get("url")
+        candidate_url = normalize_same_host_url(target_url, raw_url)
         if not candidate_url:
+            skipped_host_mismatch += 1
+            if record:
+                append_log(record, f"[katana-seed][skip][host-mismatch] {raw_url!r} does not match target host {target_url!r}")
             continue
-        if int(item.get("status_code") or 0) not in KATANA_SEED_STATUS_CODES:
+        status_code = int(item.get("status_code") or 0)
+        if status_code not in KATANA_SEED_STATUS_CODES:
+            skipped_status.append((candidate_url, status_code))
+            if record:
+                append_log(record, f"[katana-seed][skip][status={status_code}] {candidate_url}")
             continue
         if candidate_url in seen_seed_urls:
+            skipped_dedup += 1
             continue
         seen_seed_urls.add(candidate_url)
         deduped.append(item)
+        if record:
+            kw_score = katana_seed_keyword_score(item.get("url"))
+            append_log(record, f"[katana-seed][accept][status={status_code}][kw_score={kw_score}] {candidate_url}")
+    if record and (skipped_host_mismatch or skipped_status or skipped_dedup):
+        append_log(
+            record,
+            f"[katana-seed] dirsearch total={len(dirsearch_results)} accepted={len(deduped)}"
+            f" skipped_host_mismatch={skipped_host_mismatch}"
+            f" skipped_bad_status={len(skipped_status)} (codes: {sorted({s for _, s in skipped_status})})"
+            f" skipped_dedup={skipped_dedup}",
+        )
     ranked = sorted(
         deduped,
         key=lambda item: (
@@ -595,13 +618,13 @@ def run_scan_pipeline(record):
             path_map[normalized_item_url] = merge_path_item(existing, item, item.get("source") or "dirsearch")
     for item in run_katana(target_url, scan_root, record):
         push_candidate(item.get("url"), item.get("source") or "katana")
-    all_katana_seeds = build_katana_seed_list(target_url, dirsearch_results)
+    all_katana_seeds = build_katana_seed_list(target_url, dirsearch_results, record=record)
     katana_seed_limit = int(KATANA_SEED_MODE_LIMITS.get(katana_seed_mode, KATANA_SEED_MODE_LIMITS[DEFAULT_KATANA_SEED_MODE]))
     katana_seeds = all_katana_seeds if katana_seed_limit <= 0 else all_katana_seeds[:katana_seed_limit]
     if katana_seeds:
         append_log(record, f"[katana-seed] mode={katana_seed_mode} queued {len(katana_seeds)} of {len(all_katana_seeds)} dirsearch-discovered seeds as a url list")
     if katana_seed_limit > 0 and len(all_katana_seeds) > len(katana_seeds):
-        append_log(record, f"[katana-seed] truncated {len(all_katana_seeds) - len(katana_seeds)} lower-priority seeds")
+        append_log(record, f"[katana-seed] truncated {len(all_katana_seeds) - len(katana_seeds)} lower-priority seeds (mode limit={katana_seed_limit})")
     if katana_seeds:
         append_log(record, f"[katana-seed] running depth={KATANA_MAX_DEPTH} on full dirsearch seed list")
         for item in run_katana(katana_seeds, scan_root, record, output_name="katana-seeds.txt", stage_name="katana-seeds"):
