@@ -37,6 +37,9 @@ REQUEST_TIMEOUT = 12
 MAX_FETCH_URLS = 200
 LOG_RETENTION_LINES = 2000
 LOG_RESPONSE_LIMIT = 200
+DEFAULT_DIRSEARCH_WORDLIST = "/opt/wordlists/path-default.txt"
+CUSTOM_PATH_LIMIT = 500
+CUSTOM_PATH_LENGTH_LIMIT = 256
 KATANA_SEED_STATUS_CODES = {200, 201, 202, 204, 301, 302, 307, 308, 401, 403}
 DEFAULT_KATANA_SEED_MODE = "auto"
 KATANA_SEED_MODE_LIMITS = {
@@ -47,6 +50,7 @@ KATANA_SEED_MODE_LIMITS = {
     "unlimited": 0,
 }
 KATANA_MAX_DEPTH = 3
+KATANA_TARGETED_SEED_LIMIT = 10
 KATANA_PRIORITY_KEYWORDS = [
     "admin",
     "administrator",
@@ -61,7 +65,7 @@ KATANA_PRIORITY_KEYWORDS = [
     "control",
     "manage",
 ]
-AGENT_VERSION = "2.4.0"
+AGENT_VERSION = "2.4.5"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 PYTHON_BIN = os.getenv("PATH_AGENT_PYTHON", sys.executable or "python3")
 
@@ -101,12 +105,44 @@ def normalize_target_url(raw_url):
     if not parsed.hostname:
         raise ValueError("target_url host is empty")
     scheme = parsed.scheme or "http"
-    return f"{scheme}://{parsed.hostname}/"
+    path = parsed.path or "/"
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{scheme}://{parsed.netloc}{path}{query}"
+
+
+def normalize_site_root(raw_url):
+    parsed = urlparse(raw_url if "://" in str(raw_url or "") else "http://" + str(raw_url or ""))
+    if not parsed.hostname:
+        raise ValueError("target_url host is empty")
+    scheme = parsed.scheme or "http"
+    return f"{scheme}://{parsed.netloc}/"
 
 
 def normalize_katana_seed_mode(value):
     normalized = str(value or "").strip().lower()
     return normalized if normalized in KATANA_SEED_MODE_LIMITS else DEFAULT_KATANA_SEED_MODE
+
+
+def normalize_custom_paths(values):
+    if not isinstance(values, list):
+        return []
+    normalized = []
+    seen = set()
+    for raw_value in values:
+        value = str(raw_value or "").strip().replace("\\", "/")
+        value = value.split("?", 1)[0].split("#", 1)[0].lstrip("/")
+        value = "/".join(part for part in value.split("/") if part not in {"", ".", ".."})
+        if not value:
+            continue
+        if len(value) > CUSTOM_PATH_LENGTH_LIMIT:
+            value = value[:CUSTOM_PATH_LENGTH_LIMIT]
+        if value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+        if len(normalized) >= CUSTOM_PATH_LIMIT:
+            break
+    return normalized
 
 
 def make_scan_snapshot(record):
@@ -125,6 +161,7 @@ def make_scan_snapshot(record):
         "completed_at": int(record.get("completed_at") or 0),
         "log_count": int(record.get("log_cursor") or 0),
         "katana_seed_mode": record.get("katana_seed_mode", DEFAULT_KATANA_SEED_MODE),
+        "custom_paths": list(record.get("custom_paths") or []),
         "queued": record["task_id"] not in running_tasks and any(item == record["task_id"] for item in list(task_queue.queue)),
         "running": record["task_id"] in running_tasks,
         "result": record.get("result"),
@@ -158,7 +195,7 @@ def make_log_snapshot(record, offset=0, limit=LOG_RESPONSE_LIMIT):
     }
 
 
-def create_record(target_url, panel_task_id, katana_seed_mode=DEFAULT_KATANA_SEED_MODE):
+def create_record(target_url, panel_task_id, katana_seed_mode=DEFAULT_KATANA_SEED_MODE, custom_paths=None):
     task_id = uuid.uuid4().hex
     scan_root = os.path.join(OUTPUT_DIR, "scans", task_id)
     os.makedirs(scan_root, exist_ok=True)
@@ -167,6 +204,7 @@ def create_record(target_url, panel_task_id, katana_seed_mode=DEFAULT_KATANA_SEE
         "panel_task_id": panel_task_id,
         "target_url": target_url,
         "katana_seed_mode": normalize_katana_seed_mode(katana_seed_mode),
+        "custom_paths": normalize_custom_paths(custom_paths or []),
         "scan_root": scan_root,
         "status": "queued",
         "paths_count": 0,
@@ -264,21 +302,24 @@ def parse_dirsearch_results(result_path, target_url):
         return results
 
     entries = []
-    if isinstance(payload, dict):
-        if isinstance(payload.get("results"), list):
-            entries = payload.get("results", [])
-        elif isinstance(payload.get("results"), dict):
-            for item in payload.get("results", {}).values():
-                if isinstance(item, list):
-                    entries.extend(item)
-        elif isinstance(payload.get("data"), dict):
-            for item in payload.get("data", {}).values():
-                if isinstance(item, list):
-                    entries.extend(item)
-        elif isinstance(payload.get("data"), list):
-            entries = payload.get("data", [])
-    elif isinstance(payload, list):
-        entries = payload
+    stack = [payload]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, list):
+            stack.extend(current)
+            continue
+        if not isinstance(current, dict):
+            continue
+        status_value = current.get("status")
+        if status_value is None:
+            status_value = current.get("status_code")
+        if status_value is None:
+            status_value = current.get("response-status")
+        if (current.get("url") or current.get("path")) and status_value is not None:
+            entries.append(current)
+        for value in current.values():
+            if isinstance(value, (list, dict)):
+                stack.append(value)
 
     for entry in entries:
         if not isinstance(entry, dict):
@@ -289,26 +330,87 @@ def parse_dirsearch_results(result_path, target_url):
             url_value = urljoin(target_url, path_value)
         if not url_value:
             continue
+        status_value = entry.get("status")
+        if status_value is None:
+            status_value = entry.get("status_code")
+        if status_value is None:
+            status_value = entry.get("response-status")
         results.append(
             {
                 "url": url_value,
-                "status_code": int(entry.get("status") or entry.get("status_code") or 0),
+                "status_code": int(status_value or 0),
                 "source": "dirsearch",
             }
         )
     return results
 
 
+def parse_dirsearch_log(log_path, target_url):
+    results = []
+    if not os.path.isfile(log_path):
+        return results
+    line_re = re.compile(r"\[(?:\d{2}:\d{2}:\d{2})\]\s+(?P<status>\d{3})\s+-.*?-\s+`(?P<url>https?://[^`]+)`(?:\s*->\s*`(?P<redirect>https?://[^`]+)`)?", re.I)
+    try:
+        with open(log_path, "rt", encoding="utf8", errors="ignore") as file_handle:
+            for raw_line in file_handle:
+                line = str(raw_line or "").strip()
+                match = line_re.search(line)
+                if not match:
+                    continue
+                preferred_url = (match.group("redirect") or match.group("url") or "").strip()
+                normalized_url = normalize_same_host_url(target_url, preferred_url)
+                if not normalized_url:
+                    normalized_url = normalize_same_host_url(target_url, match.group("url") or "")
+                if not normalized_url:
+                    continue
+                results.append(
+                    {
+                        "url": normalized_url,
+                        "status_code": int(match.group("status") or 0),
+                        "source": "dirsearch-log",
+                    }
+                )
+    except Exception:
+        return []
+    return results
+
+
+def build_dirsearch_wordlist(scan_root, custom_paths):
+    normalized_custom_paths = normalize_custom_paths(custom_paths)
+    if not normalized_custom_paths:
+        return DEFAULT_DIRSEARCH_WORDLIST, 0
+    merged_lines = []
+    seen = set()
+    for path_value in normalized_custom_paths:
+        if path_value not in seen:
+            seen.add(path_value)
+            merged_lines.append(path_value)
+    if os.path.isfile(DEFAULT_DIRSEARCH_WORDLIST):
+        with open(DEFAULT_DIRSEARCH_WORDLIST, "rt", encoding="utf8", errors="ignore") as file_handle:
+            for line in file_handle:
+                candidate = str(line or "").strip()
+                if not candidate or candidate.startswith("#") or candidate in seen:
+                    continue
+                seen.add(candidate)
+                merged_lines.append(candidate)
+    custom_wordlist_path = os.path.join(scan_root, "dirsearch-wordlist.txt")
+    with open(custom_wordlist_path, "wt", encoding="utf8", newline="\n") as file_handle:
+        file_handle.write("\n".join(merged_lines) + "\n")
+    return custom_wordlist_path, len(normalized_custom_paths)
+
+
 def run_dirsearch(target_url, scan_root, record):
     output_path = os.path.join(scan_root, "dirsearch.json")
     log_path = os.path.join(scan_root, "dirsearch.log")
+    wordlist_path, custom_count = build_dirsearch_wordlist(scan_root, record.get("custom_paths"))
+    append_log(record, f"[dirsearch] wordlist={wordlist_path} custom_paths={custom_count}")
     cmd = [
         PYTHON_BIN,
         "/opt/dirsearch/dirsearch.py",
         "-u",
         target_url,
         "-w",
-        "/opt/wordlists/path-default.txt",
+        wordlist_path,
         "-o",
         "--json-report=" + output_path,
         "--quiet-mode",
@@ -320,6 +422,10 @@ def run_dirsearch(target_url, scan_root, record):
         append_log(record, f"[dirsearch] failed: {exc}")
         return []
     results = parse_dirsearch_results(output_path, target_url)
+    if not results:
+        results = parse_dirsearch_log(log_path, target_url)
+        if results:
+            append_log(record, f"[dirsearch] fallback parsed {len(results)} candidate paths from stdout log")
     append_log(record, f"[dirsearch] discovered {len(results)} candidate paths")
     return results
 
@@ -387,9 +493,11 @@ def normalize_same_host_url(base_target, candidate):
         return ""
     if parsed.hostname != base_parsed.hostname:
         return ""
+    base_scheme = base_parsed.scheme or parsed.scheme
+    base_netloc = base_parsed.netloc or parsed.netloc
     path = parsed.path or "/"
     query = ("?" + parsed.query) if parsed.query else ""
-    return f"{parsed.scheme}://{parsed.netloc}{path}{query}"
+    return f"{base_scheme}://{base_netloc}{path}{query}"
 
 
 def extract_title(soup):
@@ -587,6 +695,7 @@ def build_katana_seed_list(target_url, dirsearch_results, record=None):
 
 def run_scan_pipeline(record):
     target_url = record["target_url"]
+    site_root = normalize_site_root(target_url)
     scan_root = record["scan_root"]
     katana_seed_mode = normalize_katana_seed_mode(record.get("katana_seed_mode"))
     candidates = {}
@@ -605,9 +714,14 @@ def run_scan_pipeline(record):
             pending.put(normalized)
 
     append_log(record, f"[scan] start target={target_url}")
-    push_candidate(target_url, "root")
-    append_log(record, "[scan] root URL queued")
-    for item in run_dirsearch(target_url, scan_root, record):
+    push_candidate(site_root, "root")
+    if target_url != site_root:
+        push_candidate(target_url, "seed")
+        append_log(record, f"[scan] root URL queued: {site_root}")
+        append_log(record, f"[scan] target seed queued: {target_url}")
+    else:
+        append_log(record, "[scan] root URL queued")
+    for item in run_dirsearch(site_root, scan_root, record):
         normalized_item_url = normalize_same_host_url(target_url, item.get("url"))
         dirsearch_results.append(item)
         push_candidate(normalized_item_url, item.get("source") or "dirsearch")
@@ -616,7 +730,10 @@ def run_scan_pipeline(record):
             item["url"] = normalized_item_url
             existing = path_map.get(normalized_item_url)
             path_map[normalized_item_url] = merge_path_item(existing, item, item.get("source") or "dirsearch")
-    for item in run_katana(target_url, scan_root, record):
+    initial_katana_targets = [site_root]
+    if target_url != site_root:
+        initial_katana_targets.append(target_url)
+    for item in run_katana(initial_katana_targets, scan_root, record):
         push_candidate(item.get("url"), item.get("source") or "katana")
     all_katana_seeds = build_katana_seed_list(target_url, dirsearch_results, record=record)
     katana_seed_limit = int(KATANA_SEED_MODE_LIMITS.get(katana_seed_mode, KATANA_SEED_MODE_LIMITS[DEFAULT_KATANA_SEED_MODE]))
@@ -629,6 +746,17 @@ def run_scan_pipeline(record):
         append_log(record, f"[katana-seed] running depth={KATANA_MAX_DEPTH} on full dirsearch seed list")
         for item in run_katana(katana_seeds, scan_root, record, output_name="katana-seeds.txt", stage_name="katana-seeds"):
             push_candidate(item.get("url"), "katana-seed")
+        targeted_seeds = katana_seeds[:KATANA_TARGETED_SEED_LIMIT]
+        if targeted_seeds:
+            append_log(
+                record,
+                f"[katana-seed] running targeted per-seed crawl for top {len(targeted_seeds)} high-priority seeds",
+            )
+        for index, seed_url in enumerate(targeted_seeds, start=1):
+            stage_name = f"katana-seed-{index}"
+            output_name = f"katana-seed-{index}.txt"
+            for item in run_katana(seed_url, scan_root, record, output_name=output_name, stage_name=stage_name):
+                push_candidate(item.get("url"), "katana-seed")
 
     while not pending.empty() and len(processed) < MAX_FETCH_URLS:
         current = pending.get()
@@ -730,9 +858,11 @@ def start_scan():
         return jsonify({"error": str(exc)}), 400
     panel_task_id = data.get("task_id")
     katana_seed_mode = normalize_katana_seed_mode(data.get("katana_seed_mode"))
-    record = create_record(target_url, panel_task_id, katana_seed_mode)
+    custom_paths = normalize_custom_paths(data.get("custom_paths"))
+    record = create_record(target_url, panel_task_id, katana_seed_mode, custom_paths)
     append_log(record, f"[queue] task created for {target_url}")
     append_log(record, f"[queue] katana seed mode: {katana_seed_mode}")
+    append_log(record, f"[queue] custom path count: {len(custom_paths)}")
     task_queue.put(record["task_id"])
     append_log(record, "[queue] task queued")
     return jsonify({"message": "Task queued", "task_id": record["task_id"]}), 202

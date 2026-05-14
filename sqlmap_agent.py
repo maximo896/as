@@ -1,12 +1,15 @@
 import argparse
 import base64
+import configparser
 import hashlib
 import json
 import os
 import pickle
+import shutil
 import secrets
 import sqlite3
 import struct
+import tempfile
 import threading
 import time
 from functools import wraps
@@ -37,7 +40,7 @@ DEFAULT_SQLMAP_RISK = 3
 DEFAULT_SQLMAP_THREADS = 4
 DEFAULT_SQLMAP_TIMEOUT = 20
 DEFAULT_SQLMAP_RETRIES = 4
-AGENT_VERSION = "2.4.0"
+AGENT_VERSION = "2.4.5"
 
 ENUM_ACTIONS = {
     "get_current_db",
@@ -176,7 +179,53 @@ def record_defaults(record):
     record.setdefault("proxy", "")
     record.setdefault("runtime_proxy", "")
     record.setdefault("runtime_proxy_file", "")
+    record.setdefault("requested_options", {})
+    record.setdefault("share_by_domain", False)
+    record["pending_job"] = normalize_job_state(record.get("pending_job"))
     return record
+
+
+def normalize_job_state(raw_value):
+    if not isinstance(raw_value, dict):
+        return None
+    root_task_id = str(raw_value.get("root_task_id") or "").strip()
+    sqlmap_task_id = str(raw_value.get("sqlmap_task_id") or "").strip()
+    if not root_task_id or not sqlmap_task_id:
+        return None
+    action = str(raw_value.get("action") or "initial_scan").strip() or "initial_scan"
+    scan_data = raw_value.get("scan_data")
+    if not isinstance(scan_data, dict):
+        scan_data = {}
+    action_args = raw_value.get("action_args")
+    if not isinstance(action_args, dict):
+        action_args = {}
+    return {
+        "root_task_id": root_task_id,
+        "sqlmap_task_id": sqlmap_task_id,
+        "scan_data": dict(scan_data),
+        "action": action,
+        "action_args": dict(action_args),
+        "created_at": int(raw_value.get("created_at") or now_ts()),
+        "started_at": int(raw_value.get("started_at") or 0),
+        "status": str(raw_value.get("status") or "").strip(),
+    }
+
+
+def set_record_pending_job(record, job=None, status=""):
+    if not record:
+        return
+    if not job:
+        record["pending_job"] = None
+        return
+    pending_job = normalize_job_state(job)
+    if not pending_job:
+        record["pending_job"] = None
+        return
+    if status:
+        pending_job["status"] = status
+    elif not pending_job.get("status"):
+        pending_job["status"] = "queued"
+    record["pending_job"] = pending_job
 
 
 def persist_record_metadata(record):
@@ -204,6 +253,9 @@ def persist_record_metadata(record):
         "proxy": record.get("proxy", ""),
         "runtime_proxy": record.get("runtime_proxy", ""),
         "runtime_proxy_file": record.get("runtime_proxy_file", ""),
+        "requested_options": record.get("requested_options", {}),
+        "share_by_domain": bool(record.get("share_by_domain", False)),
+        "pending_job": record.get("pending_job"),
     }
     path = metadata_file_path(scan_root)
     temp_path = f"{path}.tmp"
@@ -300,6 +352,8 @@ def create_record(root_task_id, domain, vuln_id, request_file, scan_root, force_
         "proxy": "",
         "runtime_proxy": "",
         "runtime_proxy_file": "",
+        "requested_options": {},
+        "share_by_domain": False,
     }
     )
     scan_records[root_task_id] = record
@@ -307,19 +361,77 @@ def create_record(root_task_id, domain, vuln_id, request_file, scan_root, force_
     return record
 
 
-def find_shared_record_by_domain(domain, proxy, force_ssl):
+def build_scan_root(domain, vuln_id, root_task_id):
+    scan_name = sanitize_path_component(f"{domain}.{vuln_id}")
+    task_name = sanitize_path_component(str(root_task_id))
+    return os.path.join(OUTPUT_DIR, "scans", f"{scan_name}.{task_name}")
+
+
+def clone_cache_from_record(source_record, target_record):
+    if not source_record or not target_record:
+        return
+    target_record["cached_content"] = dict(source_record.get("cached_content") or {})
+    target_record["automation"] = {
+        "enabled": bool((source_record.get("automation") or {}).get("enabled", True)),
+        "completed": list((source_record.get("automation") or {}).get("completed", [])),
+    }
+    target_record["shell_probe"] = dict(source_record.get("shell_probe") or {"status": "unknown", "message": ""})
+    target_record["history"] = list(source_record.get("history") or [])
+    source_snapshot = build_scan_snapshot(source_record["root_task_id"], include_logs=False)
+    if source_snapshot.get("content"):
+        target_record["cached_content"] = merge_content(target_record.get("cached_content", {}), source_snapshot.get("content", {}))
+    cloned_snapshot = dict(source_snapshot)
+    cloned_snapshot["running"] = False
+    cloned_snapshot["queued"] = False
+    cloned_snapshot["status"] = "completed"
+    cloned_snapshot["sqlmap_status"] = "terminated"
+    target_record["last_error"] = ""
+    target_record["phase"] = derive_human_phase(cloned_snapshot)
+    target_record["status"] = "completed"
+    target_record["updated_at"] = now_ts()
+
+
+def record_has_meaningful_snapshot(record):
+    if not record:
+        return False
+    snapshot = build_scan_snapshot(record["root_task_id"], include_logs=False)
+    content = snapshot.get("content", {}) or {}
+    if content.get("techniques"):
+        return True
+    if content.get("current_db"):
+        return True
+    if content.get("dbs"):
+        return True
+    if content.get("tables"):
+        return True
+    if content.get("columns"):
+        return True
+    if snapshot.get("dump_files"):
+        return True
+    return False
+
+
+def find_shared_record_by_domain(domain, proxy, force_ssl, requested_options=None):
     domain = (domain or "").strip().lower()
     if not domain:
         return None
     proxy = (proxy or "").strip()
+    requested_options = normalize_requested_options(requested_options)
     target = None
     target_ts = -1
     for record in scan_records.values():
+        if not bool(record.get("share_by_domain", False)):
+            continue
+        record_status = str(record.get("status") or "").strip().lower()
+        if record_status in ("running", "queued") or record["root_task_id"] in running_tasks or any(item["root_task_id"] == record["root_task_id"] for item in task_queue):
+            continue
         if (record.get("domain") or "").strip().lower() != domain:
             continue
         if bool(record.get("force_ssl", False)) != bool(force_ssl):
             continue
         if (record.get("proxy") or "").strip() != proxy:
+            continue
+        if normalize_requested_options(record.get("requested_options")) != requested_options:
             continue
         ts = int(record.get("updated_at") or 0)
         if ts > target_ts:
@@ -352,6 +464,7 @@ def queue_job(root_task_id, sqlmap_task_id, scan_data, action, action_args=None)
         record["phase"] = f"queued:{action}"
         record["latest_action"] = action
         record["updated_at"] = now_ts()
+        set_record_pending_job(record, job, "queued")
         persist_record_metadata(record)
 
     process_next_in_queue()
@@ -365,12 +478,13 @@ def process_next_in_queue():
         while len(running_tasks) < MAX_CONCURRENT_SCANS and task_queue:
             job = task_queue.pop(0)
             root_task_id = job["root_task_id"]
+            started_at = now_ts()
             running_tasks[root_task_id] = {
                 "status": "running",
                 "action": job["action"],
                 "sqlmap_task_id": job["sqlmap_task_id"],
                 "action_args": job.get("action_args", {}),
-                "started_at": now_ts(),
+                "started_at": started_at,
             }
             record = scan_records.get(root_task_id)
             if record:
@@ -379,6 +493,9 @@ def process_next_in_queue():
                 record["latest_action"] = job["action"]
                 record["active_task_id"] = job["sqlmap_task_id"]
                 record["updated_at"] = now_ts()
+                running_job = dict(job)
+                running_job["started_at"] = started_at
+                set_record_pending_job(record, running_job, "running")
                 persist_record_metadata(record)
             started_jobs.append(job)
 
@@ -401,26 +518,48 @@ def start_sqlmap_task(job):
             error_message = start_res.get("message", "Failed to start sqlmap task")
         else:
             refresh_runtime_proxy(root_task_id)
-            while True:
-                status_res = sqlmap_request("GET", f"/scan/{sqlmap_task_id}/status")
-                status = status_res.get("status", "unknown")
-                return_code = status_res.get("returncode")
-                with queue_lock:
-                    if root_task_id in running_tasks:
-                        running_tasks[root_task_id]["status"] = status
-                    record = scan_records.get(root_task_id)
-                    if record:
-                        record["status"] = status
-                        record["phase"] = derive_phase(record, action)
-                        record["updated_at"] = now_ts()
-                        persist_record_metadata(record)
-                if status in ("terminated", "not running"):
-                    break
-                time.sleep(DEFAULT_POLL_SECONDS)
+            return_code, error_message = watch_sqlmap_task(root_task_id, sqlmap_task_id, action)
     except Exception as ex:
         error_message = str(ex)
     finally:
         finalize_job(root_task_id, sqlmap_task_id, action, error_message, return_code)
+
+
+def resume_sqlmap_task(job):
+    root_task_id = job["root_task_id"]
+    sqlmap_task_id = job["sqlmap_task_id"]
+    action = job["action"]
+    refresh_runtime_proxy(root_task_id)
+    return_code, error_message = watch_sqlmap_task(root_task_id, sqlmap_task_id, action)
+    finalize_job(root_task_id, sqlmap_task_id, action, error_message, return_code)
+
+
+def watch_sqlmap_task(root_task_id, sqlmap_task_id, action):
+    return_code = None
+    try:
+        while True:
+            status_res = sqlmap_request("GET", f"/scan/{sqlmap_task_id}/status")
+            status = status_res.get("status", "unknown")
+            return_code = status_res.get("returncode")
+            with queue_lock:
+                if root_task_id in running_tasks:
+                    running_tasks[root_task_id]["status"] = status
+                record = scan_records.get(root_task_id)
+                if record:
+                    record["status"] = status
+                    record["phase"] = derive_phase(record, action)
+                    record["updated_at"] = now_ts()
+                    pending_job = normalize_job_state(record.get("pending_job"))
+                    if pending_job:
+                        pending_job["status"] = status
+                        record["pending_job"] = pending_job
+                    persist_record_metadata(record)
+            if status in ("terminated", "not running"):
+                break
+            time.sleep(DEFAULT_POLL_SECONDS)
+        return return_code, ""
+    except Exception as ex:
+        return return_code, str(ex)
 
 
 def finalize_job(root_task_id, sqlmap_task_id, action, error_message, return_code):
@@ -435,6 +574,7 @@ def finalize_job(root_task_id, sqlmap_task_id, action, error_message, return_cod
     fallback_job = build_empty_result_fallback_job(root_task_id, action, action_args, snapshot)
     if record:
         record["updated_at"] = now_ts()
+        set_record_pending_job(record, None)
         if error_message:
             record["last_error"] = error_message
             record["status"] = "failed"
@@ -447,6 +587,7 @@ def finalize_job(root_task_id, sqlmap_task_id, action, error_message, return_cod
             {
                 "action": action,
                 "sqlmap_task_id": sqlmap_task_id,
+                "action_args": action_args,
                 "status": record["status"],
                 "return_code": return_code,
                 "error": error_message,
@@ -657,12 +798,53 @@ def normalize_dbs(raw_value):
     dedup = []
     seen = set()
     for item in values:
-        key = item.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append(item)
+        normalized_items = normalize_db_candidates(item)
+        for candidate in normalized_items:
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            dedup.append(candidate)
     return dedup
+
+
+def normalize_db_candidates(raw_value):
+    value = str(raw_value or "").strip()
+    if not value:
+        return []
+
+    retrieved_matches = re.findall(r"retrieved:\s*'([^']+)'", value, flags=re.I)
+    if retrieved_matches:
+        candidates = []
+        for item in retrieved_matches:
+            cleaned = str(item or "").strip()
+            if cleaned:
+                candidates.append(cleaned)
+        return candidates
+
+    if "\n" in value:
+        candidates = []
+        for line in value.splitlines():
+            candidates.extend(normalize_db_candidates(line))
+        return candidates
+
+    # sqlmap API can occasionally mix interactive prompt lines into enum output.
+    lower_value = value.lower()
+    if "do you want to merge them in further requests?" in lower_value:
+        return []
+    if "you provided a http cookie header value" in lower_value:
+        return []
+
+    if re.match(r"^\[[^\]]+\]\s+\[[A-Z]+\]", value):
+        return []
+
+    if any(token in value for token in ("\r", "\t")):
+        return []
+
+    if len(value) > 256:
+        return []
+
+    return [value]
 
 
 def normalize_tables(raw_value):
@@ -906,6 +1088,8 @@ def derive_shell_probe(snapshot):
 
 
 def derive_status_from_snapshot(snapshot):
+    if snapshot.get("status") == "pending":
+        return "pending"
     if snapshot.get("running"):
         return "running"
     if snapshot.get("queued"):
@@ -941,23 +1125,24 @@ def build_scan_snapshot(root_task_id, include_logs=True):
     if not record:
         return {"error": "Task not found"}
 
-    active_task_id = record["active_task_id"]
+    active_task_id = str(record.get("active_task_id") or "").strip()
     status_res = {}
     data_res = {}
     logs_res = {}
-    try:
-        status_res = sqlmap_request("GET", f"/scan/{active_task_id}/status")
-    except Exception as ex:
-        status_res = {"status": "unreachable", "error": str(ex)}
-    try:
-        data_res = sqlmap_request("GET", f"/scan/{active_task_id}/data")
-    except Exception as ex:
-        data_res = {"data": [], "error": [str(ex)]}
-    if include_logs:
+    if active_task_id:
         try:
-            logs_res = sqlmap_request("GET", f"/scan/{active_task_id}/log")
-        except Exception:
-            logs_res = {"log": []}
+            status_res = sqlmap_request("GET", f"/scan/{active_task_id}/status")
+        except Exception as ex:
+            status_res = {"status": "unreachable", "error": str(ex)}
+        try:
+            data_res = sqlmap_request("GET", f"/scan/{active_task_id}/data")
+        except Exception as ex:
+            data_res = {"data": [], "error": [str(ex)]}
+        if include_logs:
+            try:
+                logs_res = sqlmap_request("GET", f"/scan/{active_task_id}/log")
+            except Exception:
+                logs_res = {"log": []}
 
     session_file = find_session_file(record)
     serialized_injections = session_query_value(session_file, HASHDB_KEYS["injections"])
@@ -975,6 +1160,17 @@ def build_scan_snapshot(root_task_id, include_logs=True):
     if not content["techniques"]:
         content["techniques"] = normalize_techniques(safe_unpickle(serialized_injections))
     record["cached_content"] = merge_content(record.get("cached_content", {}), content)
+    errors = [item[0] if isinstance(item, list) else item for item in data_res.get("error", [])]
+    has_meaningful_local_result = bool(
+        content.get("techniques")
+        or content.get("current_db")
+        or content.get("dbs")
+        or content.get("tables")
+        or content.get("columns")
+        or dump_files
+    )
+    if status_res.get("status") == "unreachable" and has_meaningful_local_result and root_task_id not in running_tasks and not any(item["root_task_id"] == root_task_id for item in task_queue):
+        errors = []
 
     snapshot = {
         "task_id": root_task_id,
@@ -997,11 +1193,12 @@ def build_scan_snapshot(root_task_id, include_logs=True):
         "content": content,
         "session": session_state,
         "dump_files": dump_files,
-        "errors": [item[0] if isinstance(item, list) else item for item in data_res.get("error", [])],
+        "errors": errors,
         "logs": logs_res.get("log", []),
         "history": record.get("history", []),
         "automation": record.get("automation", {}),
         "shell_probe": record.get("shell_probe", {}),
+        "requested_options": normalize_requested_options(record.get("requested_options")),
         "requested_proxy": record.get("proxy", ""),
         "runtime_proxy": record.get("runtime_proxy", ""),
         "runtime_proxy_file": record.get("runtime_proxy_file", ""),
@@ -1121,6 +1318,18 @@ def build_empty_result_fallback_job(root_task_id, action, action_args, snapshot)
     return build_automation_job(root_task_id, action, next_args)
 
 
+def recovery_action_requires_args(action):
+    return action in {
+        "get_tables",
+        "get_columns",
+        "dump_first_row",
+        "dump_table_data",
+        "search_column",
+        "search",
+        "count_rows",
+    }
+
+
 def create_follow_up_sqlmap_task():
     new_task_res = sqlmap_request("GET", "/task/new")
     task_id = new_task_res.get("taskid")
@@ -1129,16 +1338,157 @@ def create_follow_up_sqlmap_task():
     return task_id
 
 
+def get_sqlmap_task_status(sqlmap_task_id):
+    try:
+        status_res = sqlmap_request("GET", f"/scan/{sqlmap_task_id}/status")
+        return str(status_res.get("status") or "").strip().lower(), ""
+    except Exception as ex:
+        return "", str(ex)
+
+
+def build_recovery_job(record):
+    pending_job = normalize_job_state(record.get("pending_job"))
+    if pending_job:
+        pending_job["scan_data"] = apply_proxy_to_scan_data(pending_job.get("scan_data"), record.get("proxy", ""))
+        return pending_job
+
+    action = str(record.get("latest_action") or "initial_scan").strip() or "initial_scan"
+    action_args = {}
+    history = record.get("history") or []
+    if history:
+        latest_history = history[-1]
+        if isinstance(latest_history, dict) and str(latest_history.get("action") or "").strip() == action:
+            stored_action_args = latest_history.get("action_args")
+            if isinstance(stored_action_args, dict):
+                action_args = dict(stored_action_args)
+    if recovery_action_requires_args(action) and not action_args:
+        return None
+    try:
+        scan_data = build_follow_up_options(record, action, action_args)
+    except Exception:
+        return None
+
+    sqlmap_task_id = str(record.get("active_task_id") or "").strip()
+    if not sqlmap_task_id:
+        try:
+            sqlmap_task_id = create_follow_up_sqlmap_task()
+        except Exception:
+            return None
+    return normalize_job_state(
+        {
+            "root_task_id": record.get("root_task_id"),
+            "sqlmap_task_id": sqlmap_task_id,
+            "scan_data": scan_data,
+            "action": action,
+            "action_args": action_args,
+            "created_at": record.get("updated_at") or record.get("created_at") or now_ts(),
+            "status": record.get("status") or "",
+        }
+    )
+
+
+def recover_runtime_state():
+    resumed_jobs = []
+
+    for record in scan_records.values():
+        root_task_id = str(record.get("root_task_id") or "").strip()
+        if not root_task_id:
+            continue
+        phase = str(record.get("phase") or "")
+        record_status = str(record.get("status") or "").strip().lower()
+        wants_running = record_status == "running" or phase.startswith("running:")
+        wants_queued = record_status == "queued" or phase.startswith("queued:")
+        if not wants_running and not wants_queued:
+            set_record_pending_job(record, None)
+            persist_record_metadata(record)
+            continue
+
+        job = build_recovery_job(record)
+        if not job:
+            record["status"] = "failed"
+            record["phase"] = "recovery_failed"
+            record["last_error"] = "pending job metadata missing; manual retry required"
+            record["updated_at"] = now_ts()
+            set_record_pending_job(record, None)
+            persist_record_metadata(record)
+            continue
+
+        sqlmap_status, status_error = get_sqlmap_task_status(job["sqlmap_task_id"])
+        task_is_active = bool(sqlmap_status) and sqlmap_status not in ("terminated", "not running")
+
+        if task_is_active or (wants_running and status_error):
+            started_at = int(job.get("started_at") or job.get("created_at") or now_ts())
+            with queue_lock:
+                if root_task_id not in running_tasks:
+                    running_tasks[root_task_id] = {
+                        "status": sqlmap_status or "running",
+                        "action": job["action"],
+                        "sqlmap_task_id": job["sqlmap_task_id"],
+                        "action_args": job.get("action_args", {}),
+                        "started_at": started_at,
+                    }
+            record["status"] = sqlmap_status or "running"
+            record["phase"] = f"running:{job['action']}"
+            record["latest_action"] = job["action"]
+            record["active_task_id"] = job["sqlmap_task_id"]
+            record["updated_at"] = now_ts()
+            job["started_at"] = started_at
+            set_record_pending_job(record, job, "running")
+            persist_record_metadata(record)
+            resumed_jobs.append(job)
+            continue
+
+        if wants_queued:
+            with queue_lock:
+                if root_task_id not in running_tasks and not any(item["root_task_id"] == root_task_id for item in task_queue):
+                    task_queue.append(job)
+            record["status"] = "queued"
+            record["phase"] = f"queued:{job['action']}"
+            record["latest_action"] = job["action"]
+            record["active_task_id"] = job["sqlmap_task_id"]
+            record["updated_at"] = now_ts()
+            set_record_pending_job(record, job, "queued")
+            persist_record_metadata(record)
+            continue
+
+        snapshot = build_scan_snapshot(root_task_id, include_logs=False)
+        record["status"] = snapshot.get("status", record.get("status"))
+        record["phase"] = snapshot.get("phase", record.get("phase"))
+        record["updated_at"] = now_ts()
+        set_record_pending_job(record, None)
+        persist_record_metadata(record)
+
+    for job in resumed_jobs:
+        thread = threading.Thread(target=resume_sqlmap_task, args=(job,))
+        thread.daemon = True
+        thread.start()
+
+    process_next_in_queue()
+
+
 def parse_sqlmap_config(content):
     result = {}
-    for raw_line in (content or "").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or line.startswith(";"):
-            continue
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        result[key.strip().lower()] = value.strip()
+    parser = configparser.RawConfigParser()
+    parser.optionxform = str.lower
+    normalized = (content or "").strip()
+    if not normalized:
+        return result
+    try:
+        if "[" not in normalized.splitlines()[0]:
+            normalized = "[target]\n" + normalized
+        parser.read_string(normalized)
+        for section in parser.sections():
+            for key, value in parser.items(section):
+                result[str(key).strip().lower()] = str(value).strip()
+    except Exception:
+        for raw_line in (content or "").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith(";") or line.startswith("["):
+                continue
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            result[key.strip().lower()] = value.strip()
     return result
 
 
@@ -1149,7 +1499,20 @@ def find_runtime_sqlmap_config(record):
         return "", ""
 
     candidates = []
-    for root in ("/tmp", "/var/tmp"):
+    search_roots = []
+    for root in (
+        tempfile.gettempdir(),
+        os.getenv("TMPDIR"),
+        os.getenv("TEMP"),
+        os.getenv("TMP"),
+        "/tmp",
+        "/var/tmp",
+    ):
+        normalized = os.path.abspath(root) if root else ""
+        if not normalized or normalized in search_roots:
+            continue
+        search_roots.append(normalized)
+    for root in search_roots:
         if not os.path.isdir(root):
             continue
         try:
@@ -1191,6 +1554,40 @@ def refresh_runtime_proxy(root_task_id):
     persist_record_metadata(record)
 
 
+def clear_scan_runtime_artifacts(record):
+    scan_root = os.path.abspath(record.get("scan_root") or "")
+    request_file = os.path.abspath(record.get("request_file") or "")
+    metadata_path = os.path.abspath(metadata_file_path(scan_root)) if scan_root else ""
+    if not scan_root or not os.path.isdir(scan_root):
+        return
+    for entry in os.listdir(scan_root):
+        target_path = os.path.abspath(os.path.join(scan_root, entry))
+        if target_path in (request_file, metadata_path):
+            continue
+        try:
+            if os.path.isdir(target_path):
+                shutil.rmtree(target_path)
+            elif os.path.exists(target_path):
+                os.remove(target_path)
+        except Exception:
+            pass
+
+
+def apply_proxy_to_scan_data(scan_data, proxy):
+    updated = dict(scan_data or {})
+    if proxy:
+        updated["proxy"] = proxy
+    else:
+        updated.pop("proxy", None)
+    return updated
+
+
+def normalize_requested_options(raw_value):
+    if isinstance(raw_value, dict):
+        return {str(key): value for key, value in raw_value.items() if str(key).strip()}
+    return {}
+
+
 def build_follow_up_options(record, action, action_args):
     profile = get_fallback_profile(action_args.get("fallback_index", 0))
     base = {
@@ -1201,7 +1598,6 @@ def build_follow_up_options(record, action, action_args):
         "level": DEFAULT_SQLMAP_LEVEL,
         "risk": DEFAULT_SQLMAP_RISK,
         "randomAgent": True,
-        "smart": True,
         "parseErrors": True,
         "keepAlive": True,
         "skipWaf": True,
@@ -1209,6 +1605,7 @@ def build_follow_up_options(record, action, action_args):
         "timeout": DEFAULT_SQLMAP_TIMEOUT,
         "retries": DEFAULT_SQLMAP_RETRIES,
     }
+    base.update(normalize_requested_options(record.get("requested_options")))
     base.update(profile.get("options", {}))
     if record.get("proxy"):
         base["proxy"] = record["proxy"]
@@ -1405,20 +1802,40 @@ def start_scan():
     request_data = data.get("request_data")
     force_ssl = bool(data.get("force_ssl", False))
     proxy = data.get("proxy") or ""
+    requested_options = normalize_requested_options(data.get("options"))
+    share_by_domain = bool(data.get("share_by_domain", False))
 
     if not all([domain, vuln_id, request_data]):
         return jsonify({"error": "Missing required fields"}), 400
 
-    scan_name = sanitize_path_component(f"{domain}.{vuln_id}")
-    scan_root = os.path.join(OUTPUT_DIR, "scans", scan_name)
+    if share_by_domain:
+        shared_record = find_shared_record_by_domain(domain, proxy, force_ssl, requested_options)
+        if shared_record and record_has_meaningful_snapshot(shared_record):
+            root_task_id = f"shared-{secrets.token_hex(12)}"
+            scan_root = build_scan_root(domain, vuln_id, root_task_id)
+            os.makedirs(scan_root, exist_ok=True)
+            request_file = os.path.join(scan_root, "request.txt")
+            with open(request_file, "wt", encoding="utf8", newline="") as file_handle:
+                file_handle.write(request_data)
+            record = create_record(root_task_id, domain, vuln_id, request_file, scan_root, force_ssl)
+            record["proxy"] = proxy
+            record["requested_options"] = requested_options
+            record["share_by_domain"] = True
+            record["active_task_id"] = ""
+            clone_cache_from_record(shared_record, record)
+            persist_record_metadata(record)
+            return jsonify({"message": "Reusing shared domain session snapshot", "task_id": root_task_id, "shared_from": shared_record["root_task_id"]}), 200
+
+    root_task_id = create_follow_up_sqlmap_task()
+    scan_root = build_scan_root(domain, vuln_id, root_task_id)
     os.makedirs(scan_root, exist_ok=True)
     request_file = os.path.join(scan_root, "request.txt")
     with open(request_file, "wt", encoding="utf8", newline="") as file_handle:
         file_handle.write(request_data)
-
-    root_task_id = create_follow_up_sqlmap_task()
     record = create_record(root_task_id, domain, vuln_id, request_file, scan_root, force_ssl)
     record["proxy"] = proxy
+    record["requested_options"] = requested_options
+    record["share_by_domain"] = share_by_domain
     persist_record_metadata(record)
     scan_data = build_follow_up_options(scan_records[root_task_id], "initial_scan", {})
     ok, message, _ = queue_job(root_task_id, root_task_id, scan_data, "initial_scan")
@@ -1495,6 +1912,35 @@ def update_scan_proxy(root_task_id):
     data = request.json or {}
     proxy = (data.get("proxy") or "").strip()
     record["proxy"] = proxy
+    with queue_lock:
+        for queued_job in task_queue:
+            if queued_job["root_task_id"] == root_task_id:
+                queued_job["scan_data"] = apply_proxy_to_scan_data(queued_job.get("scan_data"), proxy)
+        pending_job = normalize_job_state(record.get("pending_job"))
+        if pending_job:
+            pending_job["scan_data"] = apply_proxy_to_scan_data(pending_job.get("scan_data"), proxy)
+            record["pending_job"] = pending_job
+    active_task_id = str(record.get("active_task_id") or "").strip()
+    task_is_active = root_task_id in running_tasks or str(record.get("phase") or "").startswith("running:")
+    if task_is_active:
+        if not active_task_id:
+            persist_record_metadata(record)
+            return jsonify({"error": "proxy saved but active sqlmap task is missing"}), 502
+        try:
+            sqlmap_request("POST", f"/option/{active_task_id}/set", payload={"proxy": proxy})
+            record["runtime_proxy"] = proxy
+        except Exception as ex:
+            refresh_runtime_proxy(root_task_id)
+            persist_record_metadata(record)
+            return jsonify(
+                {
+                    "error": f"proxy saved but live update failed: {ex}",
+                    "task_id": root_task_id,
+                    "proxy": proxy,
+                    "runtime_proxy": record.get("runtime_proxy", ""),
+                    "runtime_proxy_file": record.get("runtime_proxy_file", ""),
+                }
+            ), 502
     refresh_runtime_proxy(root_task_id)
     persist_record_metadata(record)
     return jsonify(
@@ -1514,6 +1960,10 @@ def update_scan_request(root_task_id):
     record = scan_records.get(root_task_id)
     if not record:
         return jsonify({"error": "Task not found"}), 404
+    with queue_lock:
+        task_is_active = root_task_id in running_tasks or any(item["root_task_id"] == root_task_id for item in task_queue)
+    if task_is_active:
+        return jsonify({"error": "cannot update request while sqlmap task is running or queued"}), 409
     data = request.json or {}
     request_content = data.get("request_content")
     if request_content is None:
@@ -1524,6 +1974,21 @@ def update_scan_request(root_task_id):
     os.makedirs(os.path.dirname(os.path.abspath(request_file)), exist_ok=True)
     with open(request_file, "wt", encoding="utf8", newline="") as file_handle:
         file_handle.write(request_content)
+    clear_scan_runtime_artifacts(record)
+    record["active_task_id"] = ""
+    record["status"] = "pending"
+    record["phase"] = "request_updated"
+    record["last_error"] = ""
+    record["cached_content"] = {}
+    record["history"] = []
+    record["automation"] = {
+        "enabled": bool((record.get("automation") or {}).get("enabled", True)),
+        "completed": [],
+    }
+    record["shell_probe"] = {"status": "unknown", "message": ""}
+    record["runtime_proxy"] = ""
+    record["runtime_proxy_file"] = ""
+    set_record_pending_job(record, None)
     record["updated_at"] = now_ts()
     persist_record_metadata(record)
     return jsonify(
@@ -1554,4 +2019,5 @@ def get_data(root_task_id):
 
 if __name__ == "__main__":
     recover_scan_records()
+    recover_runtime_state()
     app.run(host="0.0.0.0", port=FLASK_PORT)
