@@ -40,7 +40,6 @@ LOG_RESPONSE_LIMIT = 200
 DEFAULT_DIRSEARCH_WORDLIST = "/opt/wordlists/path-default.txt"
 CUSTOM_PATH_LIMIT = 500
 CUSTOM_PATH_LENGTH_LIMIT = 256
-KATANA_SEED_STATUS_CODES = {200, 201, 202, 204, 301, 302, 307, 308, 401, 403}
 DEFAULT_KATANA_SEED_MODE = "auto"
 KATANA_SEED_MODE_LIMITS = {
     "auto": 0,
@@ -65,7 +64,7 @@ KATANA_PRIORITY_KEYWORDS = [
     "control",
     "manage",
 ]
-AGENT_VERSION = "2.4.5"
+AGENT_VERSION = "2.4.6"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 PYTHON_BIN = os.getenv("PATH_AGENT_PYTHON", sys.executable or "python3")
 
@@ -79,6 +78,13 @@ record_lock = threading.Lock()
 
 def now_ts():
     return int(time.time())
+
+
+def strip_wrapping_quotes(value):
+    text = str(value or "").strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in {"`", '"', "'"}:
+        text = text[1:-1].strip()
+    return text
 
 
 def ensure_output_dir():
@@ -98,7 +104,7 @@ def require_auth(func):
 
 
 def normalize_target_url(raw_url):
-    raw_url = (raw_url or "").strip()
+    raw_url = strip_wrapping_quotes(raw_url)
     if not raw_url:
         raise ValueError("target_url is required")
     parsed = urlparse(raw_url if "://" in raw_url else "http://" + raw_url)
@@ -111,7 +117,8 @@ def normalize_target_url(raw_url):
 
 
 def normalize_site_root(raw_url):
-    parsed = urlparse(raw_url if "://" in str(raw_url or "") else "http://" + str(raw_url or ""))
+    raw_url = strip_wrapping_quotes(raw_url)
+    parsed = urlparse(raw_url if "://" in raw_url else "http://" + raw_url)
     if not parsed.hostname:
         raise ValueError("target_url host is empty")
     scheme = parsed.scheme or "http"
@@ -324,8 +331,8 @@ def parse_dirsearch_results(result_path, target_url):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        url_value = (entry.get("url") or "").strip()
-        path_value = (entry.get("path") or "").strip()
+        url_value = strip_wrapping_quotes(entry.get("url") or "")
+        path_value = strip_wrapping_quotes(entry.get("path") or "")
         if not url_value and path_value:
             url_value = urljoin(target_url, path_value)
         if not url_value:
@@ -411,8 +418,10 @@ def run_dirsearch(target_url, scan_root, record):
         target_url,
         "-w",
         wordlist_path,
+        "-O",
+        "json",
         "-o",
-        "--json-report=" + output_path,
+        output_path,
         "--quiet-mode",
         "--random-agent",
     ]
@@ -481,7 +490,7 @@ def run_katana(target_urls, scan_root, record, output_name="katana.txt", stage_n
 
 
 def normalize_same_host_url(base_target, candidate):
-    candidate = (candidate or "").strip()
+    candidate = strip_wrapping_quotes(candidate)
     if not candidate:
         return ""
     if candidate.startswith("javascript:") or candidate.startswith("mailto:") or candidate.startswith("tel:"):
@@ -646,7 +655,6 @@ def build_katana_seed_list(target_url, dirsearch_results, record=None):
     deduped = []
     seen_seed_urls = set()
     skipped_host_mismatch = 0
-    skipped_status = []
     skipped_dedup = 0
     for item in dirsearch_results:
         raw_url = item.get("url")
@@ -657,11 +665,6 @@ def build_katana_seed_list(target_url, dirsearch_results, record=None):
                 append_log(record, f"[katana-seed][skip][host-mismatch] {raw_url!r} does not match target host {target_url!r}")
             continue
         status_code = int(item.get("status_code") or 0)
-        if status_code not in KATANA_SEED_STATUS_CODES:
-            skipped_status.append((candidate_url, status_code))
-            if record:
-                append_log(record, f"[katana-seed][skip][status={status_code}] {candidate_url}")
-            continue
         if candidate_url in seen_seed_urls:
             skipped_dedup += 1
             continue
@@ -670,12 +673,11 @@ def build_katana_seed_list(target_url, dirsearch_results, record=None):
         if record:
             kw_score = katana_seed_keyword_score(item.get("url"))
             append_log(record, f"[katana-seed][accept][status={status_code}][kw_score={kw_score}] {candidate_url}")
-    if record and (skipped_host_mismatch or skipped_status or skipped_dedup):
+    if record and (skipped_host_mismatch or skipped_dedup):
         append_log(
             record,
             f"[katana-seed] dirsearch total={len(dirsearch_results)} accepted={len(deduped)}"
             f" skipped_host_mismatch={skipped_host_mismatch}"
-            f" skipped_bad_status={len(skipped_status)} (codes: {sorted({s for _, s in skipped_status})})"
             f" skipped_dedup={skipped_dedup}",
         )
     ranked = sorted(
@@ -733,7 +735,7 @@ def run_scan_pipeline(record):
     initial_katana_targets = [site_root]
     if target_url != site_root:
         initial_katana_targets.append(target_url)
-    for item in run_katana(initial_katana_targets, scan_root, record):
+    for item in run_katana(initial_katana_targets, scan_root, record, output_name="katana-initial.txt", stage_name="katana-initial"):
         push_candidate(item.get("url"), item.get("source") or "katana")
     all_katana_seeds = build_katana_seed_list(target_url, dirsearch_results, record=record)
     katana_seed_limit = int(KATANA_SEED_MODE_LIMITS.get(katana_seed_mode, KATANA_SEED_MODE_LIMITS[DEFAULT_KATANA_SEED_MODE]))
@@ -744,7 +746,7 @@ def run_scan_pipeline(record):
         append_log(record, f"[katana-seed] truncated {len(all_katana_seeds) - len(katana_seeds)} lower-priority seeds (mode limit={katana_seed_limit})")
     if katana_seeds:
         append_log(record, f"[katana-seed] running depth={KATANA_MAX_DEPTH} on full dirsearch seed list")
-        for item in run_katana(katana_seeds, scan_root, record, output_name="katana-seeds.txt", stage_name="katana-seeds"):
+        for item in run_katana(katana_seeds, scan_root, record, output_name="katana.txt", stage_name="katana-seeds"):
             push_candidate(item.get("url"), "katana-seed")
         targeted_seeds = katana_seeds[:KATANA_TARGETED_SEED_LIMIT]
         if targeted_seeds:
