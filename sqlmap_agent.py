@@ -40,7 +40,7 @@ DEFAULT_SQLMAP_RISK = 3
 DEFAULT_SQLMAP_THREADS = 4
 DEFAULT_SQLMAP_TIMEOUT = 20
 DEFAULT_SQLMAP_RETRIES = 4
-AGENT_VERSION = "2.4.6"
+AGENT_VERSION = "2.4.7"
 
 ENUM_ACTIONS = {
     "get_current_db",
@@ -1863,7 +1863,7 @@ def run_action(root_task_id):
 
     data = request.json or {}
     action = data.get("action")
-    if action not in ("get_current_db", "get_dbs", "get_tables", "get_columns", "dump_first_row", "dump_table_data", "search_column", "probe_shell", "search", "count_rows"):
+    if action not in ("initial_scan", "get_current_db", "get_dbs", "get_tables", "get_columns", "dump_first_row", "dump_table_data", "search_column", "probe_shell", "search", "count_rows"):
         return jsonify({"error": "Unsupported action"}), 400
 
     snapshot = build_scan_snapshot(root_task_id, include_logs=False)
@@ -1876,6 +1876,7 @@ def run_action(root_task_id):
         "search_query": data.get("search_query"),
         "limit_start": data.get("limit_start"),
         "limit_stop": data.get("limit_stop"),
+        "technique": data.get("technique"),
     }
 
     try:
