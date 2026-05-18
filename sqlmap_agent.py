@@ -40,7 +40,7 @@ DEFAULT_SQLMAP_RISK = 3
 DEFAULT_SQLMAP_THREADS = 4
 DEFAULT_SQLMAP_TIMEOUT = 20
 DEFAULT_SQLMAP_RETRIES = 4
-AGENT_VERSION = "2.4.7"
+AGENT_VERSION = "2.4.8"
 
 ENUM_ACTIONS = {
     "get_current_db",
@@ -226,6 +226,24 @@ def set_record_pending_job(record, job=None, status=""):
     elif not pending_job.get("status"):
         pending_job["status"] = "queued"
     record["pending_job"] = pending_job
+
+
+def remove_queued_job(root_task_id):
+    for index, queued_job in enumerate(task_queue):
+        if queued_job.get("root_task_id") == root_task_id:
+            return task_queue.pop(index)
+    return None
+
+
+def cancel_record(record, reason):
+    if not record:
+        return
+    record["status"] = "cancelled"
+    record["phase"] = "cancelled"
+    record["last_error"] = reason
+    record["updated_at"] = now_ts()
+    set_record_pending_job(record, None)
+    persist_record_metadata(record)
 
 
 def persist_record_metadata(record):
@@ -1852,6 +1870,86 @@ def get_scan(root_task_id):
     if snapshot.get("error"):
         return jsonify(snapshot), 404
     return jsonify(snapshot)
+
+
+@app.route("/scan/<root_task_id>/cancel", methods=["POST"])
+@require_auth
+def cancel_scan(root_task_id):
+    record = scan_records.get(root_task_id)
+    if not record:
+        return jsonify({"error": "Task not found"}), 404
+
+    data = request.json or {}
+    force_kill = bool(data.get("force_kill", False))
+    active_sqlmap_task_id = ""
+    queued_removed = False
+
+    with queue_lock:
+        removed_job = remove_queued_job(root_task_id)
+        if removed_job:
+            queued_removed = True
+            cancel_record(record, "cancelled while queued")
+        running_info = running_tasks.get(root_task_id) or {}
+        pending_job = normalize_job_state(record.get("pending_job"))
+        active_sqlmap_task_id = (
+            (running_info.get("sqlmap_task_id") or "").strip()
+            or (record.get("active_task_id") or "").strip()
+            or ((pending_job or {}).get("sqlmap_task_id") or "").strip()
+        )
+        if not queued_removed and active_sqlmap_task_id:
+            record["status"] = "cancelling"
+            record["phase"] = "cancelling"
+            record["last_error"] = "cancellation requested by panel"
+            record["updated_at"] = now_ts()
+            persist_record_metadata(record)
+
+    if queued_removed:
+        return jsonify({"task_id": root_task_id, "status": "cancelled", "queued_removed": True}), 200
+
+    if not active_sqlmap_task_id:
+        cancel_record(record, "cancelled after local state cleanup")
+        return jsonify({"task_id": root_task_id, "status": "cancelled", "queued_removed": False}), 200
+
+    stop_ok = False
+    stop_error = ""
+    try:
+        stop_res = sqlmap_request("GET", f"/scan/{active_sqlmap_task_id}/stop")
+        stop_ok = bool(stop_res.get("success"))
+        if not stop_ok:
+            stop_error = stop_res.get("message", "stop rejected")
+    except Exception as ex:
+        stop_error = str(ex)
+
+    kill_ok = False
+    if force_kill or not stop_ok:
+        try:
+            kill_res = sqlmap_request("GET", f"/scan/{active_sqlmap_task_id}/kill")
+            kill_ok = bool(kill_res.get("success"))
+            if not kill_ok and not stop_error:
+                stop_error = kill_res.get("message", "kill rejected")
+        except Exception as ex:
+            if not stop_error:
+                stop_error = str(ex)
+
+    if stop_ok or kill_ok:
+        return jsonify(
+            {
+                "task_id": root_task_id,
+                "status": "cancelling",
+                "queued_removed": False,
+                "sqlmap_task_id": active_sqlmap_task_id,
+                "stop_sent": stop_ok,
+                "kill_sent": kill_ok,
+            }
+        ), 200
+
+    return jsonify(
+        {
+            "error": stop_error or "failed to cancel running task",
+            "task_id": root_task_id,
+            "sqlmap_task_id": active_sqlmap_task_id,
+        }
+    ), 502
 
 
 @app.route("/scan/<root_task_id>/action", methods=["POST"])

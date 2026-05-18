@@ -40,6 +40,7 @@ LOG_RESPONSE_LIMIT = 200
 DEFAULT_DIRSEARCH_WORDLIST = "/opt/wordlists/path-default.txt"
 CUSTOM_PATH_LIMIT = 500
 CUSTOM_PATH_LENGTH_LIMIT = 256
+METADATA_FILE_NAME = "record.json"
 DEFAULT_KATANA_SEED_MODE = "auto"
 KATANA_SEED_MODE_LIMITS = {
     "auto": 0,
@@ -64,7 +65,7 @@ KATANA_PRIORITY_KEYWORDS = [
     "control",
     "manage",
 ]
-AGENT_VERSION = "2.4.7"
+AGENT_VERSION = "2.4.8"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 PYTHON_BIN = os.getenv("PATH_AGENT_PYTHON", sys.executable or "python3")
 
@@ -76,8 +77,39 @@ running_tasks = {}
 record_lock = threading.Lock()
 
 
+class ScanCancelled(Exception):
+    pass
+
+
 def now_ts():
     return int(time.time())
+
+
+def is_cancel_requested(record):
+    return bool(record and record.get("cancel_requested"))
+
+
+def raise_if_cancelled(record):
+    if is_cancel_requested(record):
+        raise ScanCancelled(record.get("cancel_reason") or "task cancelled")
+
+
+def remove_task_from_queue(task_id):
+    removed = False
+    with task_queue.mutex:
+        queued_items = list(task_queue.queue)
+        try:
+            queued_items.remove(task_id)
+        except ValueError:
+            return False
+        task_queue.queue.clear()
+        task_queue.queue.extend(queued_items)
+        if task_queue.unfinished_tasks > 0:
+            task_queue.unfinished_tasks -= 1
+            if task_queue.unfinished_tasks == 0:
+                task_queue.all_tasks_done.notify_all()
+        removed = True
+    return removed
 
 
 def strip_wrapping_quotes(value):
@@ -90,6 +122,89 @@ def strip_wrapping_quotes(value):
 def ensure_output_dir():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(os.path.join(OUTPUT_DIR, "scans"), exist_ok=True)
+
+
+def metadata_file_path(scan_root):
+    return os.path.join(scan_root, METADATA_FILE_NAME)
+
+
+def persist_record_metadata(record):
+    scan_root = (record or {}).get("scan_root")
+    task_id = (record or {}).get("task_id")
+    if not scan_root or not task_id:
+        return
+    path = metadata_file_path(scan_root)
+    temp_path = path + ".tmp"
+    payload = dict(record)
+    try:
+        with open(temp_path, "wt", encoding="utf8", newline="\n") as file_handle:
+            json.dump(payload, file_handle, ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
+    except Exception:
+        pass
+
+
+def recover_scan_records():
+    scans_root = os.path.join(OUTPUT_DIR, "scans")
+    if not os.path.isdir(scans_root):
+        return
+    recovered = 0
+    requeued = 0
+    for entry in os.listdir(scans_root):
+        scan_root = os.path.join(scans_root, entry)
+        if not os.path.isdir(scan_root):
+            continue
+        meta_path = metadata_file_path(scan_root)
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path, "rt", encoding="utf8") as file_handle:
+                record = json.load(file_handle)
+        except Exception:
+            continue
+        if not isinstance(record, dict):
+            continue
+        task_id = str(record.get("task_id") or "").strip()
+        target_url = str(record.get("target_url") or "").strip()
+        if not task_id or not target_url:
+            continue
+        record["scan_root"] = scan_root
+        record["task_id"] = task_id
+        record["target_url"] = target_url
+        logs_value = record.get("logs")
+        record["logs"] = list(logs_value) if isinstance(logs_value, list) else []
+        result_value = record.get("result")
+        if not isinstance(result_value, dict):
+            result_value = {"target_url": target_url, "paths": []}
+        record["result"] = dict(result_value)
+        record["custom_paths"] = normalize_custom_paths(record.get("custom_paths") or [])
+        record["katana_seed_mode"] = normalize_katana_seed_mode(record.get("katana_seed_mode"))
+        record["cancel_requested"] = bool(record.get("cancel_requested", False))
+        record["cancel_reason"] = str(record.get("cancel_reason") or "")
+        record["created_at"] = int(record.get("created_at") or now_ts())
+        record["updated_at"] = int(record.get("updated_at") or now_ts())
+        record["completed_at"] = int(record.get("completed_at") or 0)
+        record["paths_count"] = int(record.get("paths_count") or 0)
+        record["forms_count"] = int(record.get("forms_count") or 0)
+        status = str(record.get("status") or "queued").strip().lower()
+        if record["cancel_requested"] or status == "cancelling":
+            record["status"] = "cancelled"
+            record["last_error"] = record["cancel_reason"] or "task cancelled before recovery"
+            record["completed_at"] = int(record.get("completed_at") or now_ts())
+            record["cancel_requested"] = False
+            record["cancel_reason"] = ""
+        elif status in {"queued", "running"}:
+            record["status"] = "queued"
+            record["last_error"] = "task requeued after agent restart"
+            record["completed_at"] = 0
+            task_queue.put(task_id)
+            requeued += 1
+        with record_lock:
+            scan_records[task_id] = record
+        persist_record_metadata(record)
+        recovered += 1
+    if recovered:
+        print(f"[path-agent] recovered {recovered} records, requeued {requeued}", flush=True)
 
 
 def require_auth(func):
@@ -217,6 +332,8 @@ def create_record(target_url, panel_task_id, katana_seed_mode=DEFAULT_KATANA_SEE
         "paths_count": 0,
         "forms_count": 0,
         "last_error": "",
+        "cancel_requested": False,
+        "cancel_reason": "",
         "created_at": now_ts(),
         "updated_at": now_ts(),
         "completed_at": 0,
@@ -229,6 +346,7 @@ def create_record(target_url, panel_task_id, katana_seed_mode=DEFAULT_KATANA_SEE
     }
     with record_lock:
         scan_records[task_id] = record
+    persist_record_metadata(record)
     return record
 
 
@@ -271,6 +389,10 @@ def run_command(cmd, cwd, stdout_path, timeout, record, stage_name):
         )
         try:
             while True:
+                if is_cancel_requested(record):
+                    proc.kill()
+                    append_log(record, f"[{stage_name}] cancelled")
+                    raise ScanCancelled(record.get("cancel_reason") or f"{stage_name} cancelled")
                 if timeout and (time.time() - started_at) > timeout:
                     proc.kill()
                     append_log(record, f"[{stage_name}] timeout after {timeout}s")
@@ -407,6 +529,7 @@ def build_dirsearch_wordlist(scan_root, custom_paths):
 
 
 def run_dirsearch(target_url, scan_root, record):
+    raise_if_cancelled(record)
     output_path = os.path.join(scan_root, "dirsearch.json")
     log_path = os.path.join(scan_root, "dirsearch.log")
     wordlist_path, custom_count = build_dirsearch_wordlist(scan_root, record.get("custom_paths"))
@@ -440,6 +563,7 @@ def run_dirsearch(target_url, scan_root, record):
 
 
 def run_katana(target_urls, scan_root, record, output_name="katana.txt", stage_name="katana"):
+    raise_if_cancelled(record)
     output_path = os.path.join(scan_root, output_name)
     normalized_targets = []
     seen_targets = set()
@@ -707,6 +831,7 @@ def run_scan_pipeline(record):
     dirsearch_results = []
 
     def push_candidate(url_value, source):
+        raise_if_cancelled(record)
         normalized = normalize_same_host_url(target_url, url_value)
         if not normalized:
             return
@@ -724,6 +849,7 @@ def run_scan_pipeline(record):
     else:
         append_log(record, "[scan] root URL queued")
     for item in run_dirsearch(site_root, scan_root, record):
+        raise_if_cancelled(record)
         normalized_item_url = normalize_same_host_url(target_url, item.get("url"))
         dirsearch_results.append(item)
         push_candidate(normalized_item_url, item.get("source") or "dirsearch")
@@ -736,6 +862,7 @@ def run_scan_pipeline(record):
     if target_url != site_root:
         initial_katana_targets.append(target_url)
     for item in run_katana(initial_katana_targets, scan_root, record, output_name="katana-initial.txt", stage_name="katana-initial"):
+        raise_if_cancelled(record)
         push_candidate(item.get("url"), item.get("source") or "katana")
     all_katana_seeds = build_katana_seed_list(target_url, dirsearch_results, record=record)
     katana_seed_limit = int(KATANA_SEED_MODE_LIMITS.get(katana_seed_mode, KATANA_SEED_MODE_LIMITS[DEFAULT_KATANA_SEED_MODE]))
@@ -747,6 +874,7 @@ def run_scan_pipeline(record):
     if katana_seeds:
         append_log(record, f"[katana-seed] running depth={KATANA_MAX_DEPTH} on full dirsearch seed list")
         for item in run_katana(katana_seeds, scan_root, record, output_name="katana.txt", stage_name="katana-seeds"):
+            raise_if_cancelled(record)
             push_candidate(item.get("url"), "katana-seed")
         targeted_seeds = katana_seeds[:KATANA_TARGETED_SEED_LIMIT]
         if targeted_seeds:
@@ -758,9 +886,11 @@ def run_scan_pipeline(record):
             stage_name = f"katana-seed-{index}"
             output_name = f"katana-seed-{index}.txt"
             for item in run_katana(seed_url, scan_root, record, output_name=output_name, stage_name=stage_name):
+                raise_if_cancelled(record)
                 push_candidate(item.get("url"), "katana-seed")
 
     while not pending.empty() and len(processed) < MAX_FETCH_URLS:
+        raise_if_cancelled(record)
         current = pending.get()
         if current in processed:
             continue
@@ -811,9 +941,19 @@ def worker_loop():
         with record_lock:
             record = scan_records.get(task_id)
             if record:
+                if is_cancel_requested(record):
+                    record["status"] = "cancelled"
+                    record["last_error"] = record.get("cancel_reason") or "task cancelled"
+                    record["completed_at"] = now_ts()
+                    record["updated_at"] = now_ts()
+                    persist_record_metadata(record)
+                    write_json(os.path.join(record["scan_root"], "snapshot.json"), make_scan_snapshot(record))
+                    task_queue.task_done()
+                    continue
                 record["status"] = "running"
                 record["updated_at"] = now_ts()
                 running_tasks[task_id] = True
+                persist_record_metadata(record)
         if not record:
             task_queue.task_done()
             continue
@@ -824,6 +964,11 @@ def worker_loop():
             record["last_error"] = ""
             record["completed_at"] = now_ts()
             append_log(record, "[queue] task completed")
+        except ScanCancelled as exc:
+            record["status"] = "cancelled"
+            record["last_error"] = str(exc)
+            record["completed_at"] = now_ts()
+            append_log(record, f"[queue] task cancelled: {exc}")
         except Exception as exc:
             record["status"] = "failed"
             record["last_error"] = str(exc)
@@ -831,6 +976,7 @@ def worker_loop():
             append_log(record, f"[queue] task failed: {exc}")
         finally:
             record["updated_at"] = now_ts()
+            persist_record_metadata(record)
             write_json(os.path.join(record["scan_root"], "snapshot.json"), make_scan_snapshot(record))
             with record_lock:
                 running_tasks.pop(task_id, None)
@@ -894,6 +1040,37 @@ def get_scan_log(task_id):
     return jsonify(payload)
 
 
+@app.route("/scan/<task_id>/cancel", methods=["POST"])
+@require_auth
+def cancel_scan(task_id):
+    queued_removed = False
+    with record_lock:
+        record = scan_records.get(task_id)
+        if not record:
+            return jsonify({"error": "Task not found"}), 404
+        record["cancel_requested"] = True
+        record["cancel_reason"] = "cancel requested by panel"
+        record["updated_at"] = now_ts()
+        if task_id not in running_tasks:
+            queued_removed = remove_task_from_queue(task_id)
+            if queued_removed:
+                record["status"] = "cancelled"
+                record["last_error"] = record["cancel_reason"]
+                record["completed_at"] = now_ts()
+        persist_record_metadata(record)
+    if queued_removed:
+        append_log(record, "[queue] queued task cancelled before execution")
+        persist_record_metadata(record)
+        write_json(os.path.join(record["scan_root"], "snapshot.json"), make_scan_snapshot(record))
+    return jsonify(
+        {
+            "task_id": task_id,
+            "status": "cancelling" if not queued_removed else "cancelled",
+            "queued_removed": queued_removed,
+        }
+    )
+
+
 def start_workers():
     worker_count = max(1, MAX_CONCURRENT_SCANS)
     for _ in range(worker_count):
@@ -920,6 +1097,7 @@ def emit_protocol_link():
 
 
 ensure_output_dir()
+recover_scan_records()
 start_workers()
 emit_protocol_link()
 
