@@ -65,7 +65,7 @@ KATANA_PRIORITY_KEYWORDS = [
     "control",
     "manage",
 ]
-AGENT_VERSION = "2.4.8"
+AGENT_VERSION = "2.4.34"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 PYTHON_BIN = os.getenv("PATH_AGENT_PYTHON", sys.executable or "python3")
 
