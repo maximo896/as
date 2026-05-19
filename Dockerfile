@@ -3,6 +3,7 @@ FROM golang:1.24 AS sqlmapsh-builder
 WORKDIR /src
 
 COPY sqlmapsh_agent/go.mod /src/go.mod
+COPY sqlmapsh_agent/go.sum /src/go.sum
 COPY sqlmapsh_agent/main.go /src/main.go
 
 RUN go mod download
