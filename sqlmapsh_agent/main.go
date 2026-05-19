@@ -101,12 +101,27 @@ func relayInteractions(ctx context.Context, resolver *net.Resolver, interaction 
 	_, _ = resolver.LookupHost(lookupCtx, interaction.FullId)
 }
 
-func buildCommandArgs(interactURL string) []string {
-	realSQLMap := envOrDefault("SQLMAP_REAL_PATH", "")
-	if realSQLMap == "" {
-		panic("SQLMAP_REAL_PATH is required")
+func resolveRealSQLMapPath() string {
+	candidates := []string{
+		strings.TrimSpace(os.Getenv("SQLMAP_REAL_PATH")),
+		"/opt/sqlmap-source/sqlmap.py",
+		"/usr/local/share/sqlmap/sqlmap.py",
 	}
 
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+
+	panic("unable to locate sqlmap.py; set SQLMAP_REAL_PATH explicitly")
+}
+
+func buildCommandArgs(interactURL string) []string {
+	realSQLMap := resolveRealSQLMapPath()
 	args := []string{realSQLMap, "--dns-domain=" + interactURL}
 	args = append(args, os.Args[1:]...)
 	return args
