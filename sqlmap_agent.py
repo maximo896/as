@@ -40,9 +40,10 @@ DEFAULT_SQLMAP_RISK = 3
 DEFAULT_SQLMAP_THREADS = 4
 DEFAULT_SQLMAP_TIMEOUT = 20
 DEFAULT_SQLMAP_RETRIES = 4
-AGENT_VERSION = "2.4.34"
+AGENT_VERSION = "2.4.36"
 
 ENUM_ACTIONS = {
+    "check_is_dba",
     "get_current_db",
     "get_dbs",
     "get_tables",
@@ -415,6 +416,8 @@ def record_has_meaningful_snapshot(record):
     snapshot = build_scan_snapshot(record["root_task_id"], include_logs=False)
     content = snapshot.get("content", {}) or {}
     if content.get("techniques"):
+        return True
+    if has_is_dba_result(content):
         return True
     if content.get("current_db"):
         return True
@@ -801,6 +804,38 @@ def normalize_current_db(raw_value):
     return ""
 
 
+def normalize_is_dba(raw_value):
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, (int, float)):
+        return bool(raw_value)
+    if isinstance(raw_value, str):
+        value = raw_value.strip().lower()
+        if value in ("1", "true", "yes", "y"):
+            return True
+        if value in ("0", "false", "no", "n"):
+            return False
+        return None
+    if isinstance(raw_value, list):
+        for item in raw_value:
+            normalized = normalize_is_dba(item)
+            if normalized is not None:
+                return normalized
+        return None
+    if isinstance(raw_value, dict):
+        for value in raw_value.values():
+            normalized = normalize_is_dba(value)
+            if normalized is not None:
+                return normalized
+    return None
+
+
+def has_is_dba_result(content):
+    return isinstance(content, dict) and content.get("is_dba") is not None
+
+
 def normalize_dbs(raw_value):
     values = []
     if isinstance(raw_value, str):
@@ -904,6 +939,7 @@ def normalize_scan_data(data_rows):
         by_type[type_name] = item.get("value")
 
     current_db = normalize_current_db(by_type.get("current_db"))
+    is_dba = normalize_is_dba(by_type.get("is_dba"))
     dbs = normalize_dbs(by_type.get("dbs"))
     tables = normalize_tables(by_type.get("tables"))
     columns = normalize_columns(by_type.get("columns"))
@@ -918,7 +954,7 @@ def normalize_scan_data(data_rows):
         "current_user": by_type.get("current_user"),
         "current_db": current_db,
         "hostname": by_type.get("hostname"),
-        "is_dba": by_type.get("is_dba"),
+        "is_dba": is_dba,
         "dbs": dbs,
         "tables": tables,
         "columns": columns,
@@ -1133,6 +1169,8 @@ def derive_human_phase(snapshot):
         return "databases_enumerated"
     if content.get("current_db"):
         return "current_database_identified"
+    if has_is_dba_result(content):
+        return "dba_checked"
     if content.get("techniques"):
         return "injection_confirmed"
     return snapshot.get("phase", "detecting_injection")
@@ -1181,6 +1219,7 @@ def build_scan_snapshot(root_task_id, include_logs=True):
     errors = [item[0] if isinstance(item, list) else item for item in data_res.get("error", [])]
     has_meaningful_local_result = bool(
         content.get("techniques")
+        or has_is_dba_result(content)
         or content.get("current_db")
         or content.get("dbs")
         or content.get("tables")
@@ -1300,6 +1339,8 @@ def action_has_meaningful_result(snapshot, action, action_args):
     database_name = action_args.get("db") or get_first_database(snapshot)
     table_name = action_args.get("table") or get_first_table(snapshot, database_name)
 
+    if action == "check_is_dba":
+        return has_is_dba_result(content)
     if action == "get_current_db":
         return bool(content.get("current_db"))
     if action == "get_dbs":
@@ -1631,9 +1672,10 @@ def build_follow_up_options(record, action, action_args):
     if action == "initial_scan":
         if action_args.get("technique"):
             base["technique"] = action_args["technique"]
-        base["getCurrentDb"] = True
         return base
-    if action == "get_current_db":
+    if action == "check_is_dba":
+        base["isDba"] = True
+    elif action == "get_current_db":
         base["getCurrentDb"] = True
     elif action == "get_dbs":
         base["getDbs"] = True
@@ -1740,6 +1782,10 @@ def build_next_automation_job(root_task_id, snapshot):
         return None
 
     completed = set(record["automation"].get("completed", []))
+    is_dba = snapshot.get("content", {}).get("is_dba")
+    if "check_is_dba" not in completed and is_dba is None:
+        return build_automation_job(root_task_id, "check_is_dba")
+
     current_db = snapshot.get("content", {}).get("current_db")
     if "get_current_db" not in completed and not current_db:
         return build_automation_job(root_task_id, "get_current_db")
@@ -1961,7 +2007,7 @@ def run_action(root_task_id):
 
     data = request.json or {}
     action = data.get("action")
-    if action not in ("initial_scan", "get_current_db", "get_dbs", "get_tables", "get_columns", "dump_first_row", "dump_table_data", "search_column", "probe_shell", "search", "count_rows"):
+    if action not in ("initial_scan", "check_is_dba", "get_current_db", "get_dbs", "get_tables", "get_columns", "dump_first_row", "dump_table_data", "search_column", "probe_shell", "search", "count_rows"):
         return jsonify({"error": "Unsupported action"}), 400
 
     snapshot = build_scan_snapshot(root_task_id, include_logs=False)
