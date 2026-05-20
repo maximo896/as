@@ -224,15 +224,42 @@ def _install_api_patch():
     api_module.Task.engine_start = _patched_engine_start
 
 
+def _try_install(label, installer, success_message):
+    try:
+        installer()
+        _warn(success_message)
+        return True
+    except Exception as ex:
+        _warn(f"[sqlmap-hook] {label} not activated: {ex}")
+        return False
+
+
 def _bootstrap():
+    port = None
     try:
         port = get_dns_port()
-        _install_dns_server_patch()
-        _install_option_patch()
-        _install_api_patch()
-        _warn(f"[sqlmap-hook] DNS server will use UDP port {port}")
+        _warn(f"[sqlmap-hook] Selected UDP port {port} for sqlmap DNS handling")
     except Exception as ex:
-        _warn(f"[sqlmap-hook] DNS hook not activated: {ex}")
+        _warn(f"[sqlmap-hook] DNS port selection failed: {ex}")
+
+    dns_patch_ok = _try_install(
+        "DNS server patch",
+        _install_dns_server_patch,
+        "[sqlmap-hook] DNS server patch installed",
+    )
+    option_patch_ok = _try_install(
+        "DNS option patch",
+        _install_option_patch,
+        "[sqlmap-hook] DNS option patch installed",
+    )
+    _try_install(
+        "API wrapper patch",
+        _install_api_patch,
+        "[sqlmap-hook] API wrapper patch installed",
+    )
+
+    if port is not None and dns_patch_ok and option_patch_ok:
+        _warn(f"[sqlmap-hook] DNS server will use UDP port {port}")
 
 
 _bootstrap()

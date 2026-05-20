@@ -20,6 +20,8 @@ export SQLMAP_REAL_PYTHON="python3"
 export SQLMAP_API_WRAPPER="/usr/local/bin/sqlmapsh-agent"
 
 mkdir -p /app/output
+SQLMAPAPI_LOG=/app/output/sqlmapapi.log
+touch "$SQLMAPAPI_LOG"
 
 if [ ! -f /opt/sqlmap-source/sqlmapapi.py ]; then
   mkdir -p /opt/sqlmap-source
@@ -43,7 +45,8 @@ exec /usr/local/bin/sqlmapsh-agent "$@"
 EOF
 chmod +x /usr/local/bin/sqlmap
 
-python3 "$SQLMAPAPI_BIN" -s -H 127.0.0.1 -p "$SQLMAPAPI_PORT" >/dev/null 2>&1 &
+echo "sqlmapapi log: $SQLMAPAPI_LOG"
+python3 "$SQLMAPAPI_BIN" -s -H 127.0.0.1 -p "$SQLMAPAPI_PORT" >>"$SQLMAPAPI_LOG" 2>&1 &
 sleep 2
 
 if [ -z "$PUBLIC_HOST" ]; then
