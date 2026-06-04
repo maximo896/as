@@ -10,13 +10,17 @@ SQLMAP_DNS_PORT_RANGE_END=${SQLMAP_DNS_PORT_RANGE_END:-40000}
 SQLMAPSH_AGENT_BIN=${SQLMAPSH_AGENT_BIN:-/usr/local/bin/sqlmapsh-agent}
 PUBLIC_HOST=${PUBLIC_HOST:-}
 HOST_PORT=${HOST_PORT:-5000}
+SQLMAP_HOOKS_PATH=${SQLMAP_HOOKS_PATH:-/opt/sqlmap-hooks}
+SQLMAP_SOURCE_PATH=${SQLMAP_SOURCE_PATH:-/opt/sqlmap-source}
 
-export PYTHONPATH="/opt/sqlmap-hooks${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${SQLMAP_HOOKS_PATH}:${SQLMAP_SOURCE_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
 export SQLMAP_DNS_PORT
 export SQLMAP_DNS_PORT_RANGE_START
 export SQLMAP_DNS_PORT_RANGE_END
-export SQLMAP_REAL_PATH="/opt/sqlmap-source/sqlmap.py"
-export SQLMAP_REAL_PYTHON="python3"
+export SQLMAP_HOOKS_PATH
+export SQLMAP_SOURCE_PATH
+export SQLMAP_REAL_PATH="${SQLMAP_REAL_PATH:-${SQLMAP_SOURCE_PATH}/sqlmap.py}"
+export SQLMAP_REAL_PYTHON="${SQLMAP_REAL_PYTHON:-python3}"
 export SQLMAP_API_WRAPPER="/usr/local/bin/sqlmapsh-agent"
 
 mkdir -p /app/output
@@ -41,6 +45,9 @@ fi
 
 cat > /usr/local/bin/sqlmap <<'EOF'
 #!/bin/sh
+SQLMAP_HOOKS_PATH=${SQLMAP_HOOKS_PATH:-/opt/sqlmap-hooks}
+SQLMAP_SOURCE_PATH=${SQLMAP_SOURCE_PATH:-/opt/sqlmap-source}
+export PYTHONPATH="${SQLMAP_HOOKS_PATH}:${SQLMAP_SOURCE_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
 exec /usr/local/bin/sqlmapsh-agent "$@"
 EOF
 chmod +x /usr/local/bin/sqlmap
