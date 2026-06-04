@@ -34,6 +34,7 @@ MAX_CONCURRENT_SCANS = args.max_concurrent or int(os.getenv("MAX_CONCURRENT_SCAN
 API_TOKEN = args.api_token or os.getenv("API_TOKEN", secrets.token_hex(16))
 FLASK_PORT = args.flask_port or int(os.getenv("FLASK_PORT", "5000"))
 DEFAULT_POLL_SECONDS = 5
+AUTOMATION_TICK_SECONDS = 10
 SESSION_FILE_NAME = "session.sqlite"
 METADATA_FILE_NAME = "record.json"
 DEFAULT_SQLMAP_LEVEL = 5
@@ -41,7 +42,7 @@ DEFAULT_SQLMAP_RISK = 3
 DEFAULT_SQLMAP_THREADS = 4
 DEFAULT_SQLMAP_TIMEOUT = 20
 DEFAULT_SQLMAP_RETRIES = 4
-AGENT_VERSION = "2.4.53"
+AGENT_VERSION = "2.4.54"
 
 SENSITIVE_TABLE_KEYWORDS = [
     "admin",
@@ -688,6 +689,57 @@ def finalize_job(root_task_id, sqlmap_task_id, action, error_message, return_cod
     process_next_in_queue()
 
 
+def is_record_active(root_task_id):
+    if root_task_id in running_tasks:
+        return True
+    return any(item.get("root_task_id") == root_task_id for item in task_queue)
+
+
+def queue_next_automation_job(root_task_id, snapshot=None):
+    record = scan_records.get(root_task_id)
+    if not record:
+        return False
+    with queue_lock:
+        if is_record_active(root_task_id):
+            return False
+    if snapshot is None:
+        snapshot = build_scan_snapshot(root_task_id, include_logs=False)
+    next_job = build_next_automation_job(root_task_id, snapshot)
+    if not next_job:
+        return False
+    ok, _, _ = queue_job(
+        root_task_id=next_job["root_task_id"],
+        sqlmap_task_id=next_job["sqlmap_task_id"],
+        scan_data=next_job["scan_data"],
+        action=next_job["action"],
+        action_args=next_job["action_args"],
+    )
+    if ok:
+        process_next_in_queue()
+    return ok
+
+
+def automation_supervisor_loop():
+    while True:
+        time.sleep(AUTOMATION_TICK_SECONDS)
+        root_task_ids = list(scan_records.keys())
+        for root_task_id in root_task_ids:
+            try:
+                queue_next_automation_job(root_task_id)
+            except Exception as ex:
+                record = scan_records.get(root_task_id)
+                if record:
+                    record["last_error"] = f"automation supervisor failed: {ex}"
+                    record["updated_at"] = now_ts()
+                    persist_record_metadata(record)
+
+
+def start_automation_supervisor():
+    thread = threading.Thread(target=automation_supervisor_loop)
+    thread.daemon = True
+    thread.start()
+
+
 def derive_phase(record, action):
     if record["status"] == "queued":
         return f"queued:{action}"
@@ -1140,9 +1192,12 @@ def find_next_sensitive_table_needing_dump(snapshot, completed):
             continue
         if has_dump_preview(snapshot, db_name, table_name):
             continue
-        if not table_has_credential_columns(snapshot, db_name, table_name):
-            continue
-        return db_name, table_name
+        columns_key = automation_key("get_columns", db_name, table_name)
+        # Prefer confirmed credential columns, but still dump a small sample from sensitive
+        # admin/user tables after column enumeration has been attempted. Some DBMS/technique
+        # combinations fail --columns while --dump -T still succeeds.
+        if table_has_credential_columns(snapshot, db_name, table_name) or columns_key in completed:
+            return db_name, table_name
     return None, None
 
 
@@ -1991,6 +2046,11 @@ def build_next_automation_job(root_task_id, snapshot):
             if db_name:
                 action_args["db"] = db_name
             return build_automation_job(root_task_id, "get_tables", action_args)
+    elif "get_tables" not in completed and not isinstance(content.get("tables"), dict):
+        # Even on slow blind techniques, make one broad --tables attempt before keyword
+        # search. This prevents the automation from stopping at technique detection when
+        # sqlmap can enumerate tables without panel intervention.
+        return build_automation_job(root_task_id, "get_tables", {"automation_key": "get_tables"})
 
     keyword = find_next_sensitive_search_keyword(completed)
     if keyword:
@@ -2400,4 +2460,5 @@ def get_data(root_task_id):
 if __name__ == "__main__":
     recover_scan_records()
     recover_runtime_state()
+    start_automation_supervisor()
     app.run(host="0.0.0.0", port=FLASK_PORT)
