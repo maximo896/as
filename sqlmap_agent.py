@@ -885,8 +885,8 @@ def normalize_techniques(raw_value):
 
 def normalize_current_db(raw_value):
     if isinstance(raw_value, str):
-        value = raw_value.strip()
-        return value if value else ""
+        candidates = normalize_db_candidates(raw_value)
+        return candidates[0] if candidates else ""
     if isinstance(raw_value, list):
         for item in raw_value:
             value = normalize_current_db(item)
@@ -978,10 +978,7 @@ def normalize_db_candidates(raw_value):
         return candidates
 
     # sqlmap API can occasionally mix interactive prompt lines into enum output.
-    lower_value = value.lower()
-    if "do you want to merge them in further requests?" in lower_value:
-        return []
-    if "you provided a http cookie header value" in lower_value:
+    if is_sqlmap_noise_line(value):
         return []
 
     if re.match(r"^\[[^\]]+\]\s+\[[A-Z]+\]", value):
@@ -996,13 +993,41 @@ def normalize_db_candidates(raw_value):
     return [value]
 
 
+def is_sqlmap_noise_line(value):
+    lower_value = str(value or "").strip().lower()
+    if not lower_value:
+        return True
+    noise_tokens = (
+        "do you want to merge them in further requests?",
+        "you provided a http cookie header value",
+        "multi-threading is considered unsafe in time-based data retrieval",
+        "are you sure of your choice (breaking warranty)",
+        "time-based comparison requires larger statistical model",
+        "please wait",
+        "[warning]",
+        "[info]",
+        "[debug]",
+        "[critical]",
+        "heuristic test shows",
+        "resuming back-end dbms",
+    )
+    if any(token in lower_value for token in noise_tokens):
+        return True
+    if re.match(r"^\[[0-9:]+\]\s+\[[a-z]+\]", lower_value):
+        return True
+    if lower_value in ("y", "n", "yes", "no"):
+        return True
+    return False
+
+
 def normalize_tables(raw_value):
     if isinstance(raw_value, dict):
         out = {}
         for db_name, table_values in raw_value.items():
-            db_key = str(db_name or "").strip()
-            if not db_key:
+            db_candidates = normalize_db_candidates(db_name)
+            if not db_candidates:
                 continue
+            db_key = db_candidates[0]
             out[db_key] = normalize_dbs(table_values)
         return out
     return {}
@@ -1013,14 +1038,16 @@ def normalize_columns(raw_value):
         return {}
     out = {}
     for db_name, table_map in raw_value.items():
-        db_key = str(db_name or "").strip()
+        db_candidates = normalize_db_candidates(db_name)
+        db_key = db_candidates[0] if db_candidates else ""
         if not db_key or not isinstance(table_map, dict):
             continue
         out[db_key] = {}
         for table_name, column_map in table_map.items():
-            table_key = str(table_name or "").strip()
-            if not table_key:
+            table_candidates = normalize_db_candidates(table_name)
+            if not table_candidates:
                 continue
+            table_key = table_candidates[0]
             if isinstance(column_map, dict):
                 out[db_key][table_key] = dict(column_map)
             elif isinstance(column_map, list):
@@ -1179,6 +1206,37 @@ def should_full_table_enum(snapshot):
     if any(keyword in joined for keyword in SLOW_ENUM_TECHNIQUE_KEYWORDS):
         return False
     return True
+
+
+def preferred_fast_technique(snapshot):
+    technique_order = [
+        ("union query", "U"),
+        ("error-based", "E"),
+        ("stacked queries", "S"),
+        ("inline query", "Q"),
+    ]
+    texts = []
+    for item in snapshot.get("content", {}).get("techniques", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for entry in item.get("entries", []) or []:
+            if isinstance(entry, dict):
+                texts.append(str(entry.get("type") or ""))
+                texts.append(str(entry.get("title") or ""))
+    joined = " ".join(texts).lower()
+    for keyword, code in technique_order:
+        if keyword in joined:
+            return code
+    return ""
+
+
+def with_fast_technique(snapshot, action_args=None):
+    updated = dict(action_args or {})
+    if not updated.get("technique"):
+        technique = preferred_fast_technique(snapshot)
+        if technique:
+            updated["technique"] = technique
+    return updated
 
 
 def find_next_database_without_tables(snapshot, completed):
@@ -1439,12 +1497,21 @@ def derive_shell_probe(snapshot):
 
 
 def derive_status_from_snapshot(snapshot):
-    if snapshot.get("status") == "pending":
-        return "pending"
+    record_status = str(snapshot.get("status") or "").strip().lower()
+    if record_status in ("pending", "queued", "running", "cancelling"):
+        return record_status
+    pending_job = normalize_job_state(snapshot.get("pending_job"))
+    if pending_job:
+        pending_status = str(pending_job.get("status") or "").strip().lower()
+        if pending_status in ("queued", "running"):
+            return pending_status
     if snapshot.get("running"):
         return "running"
     if snapshot.get("queued"):
         return "queued"
+    sqlmap_status = str(snapshot.get("sqlmap_status") or "").strip().lower()
+    if sqlmap_status and sqlmap_status not in ("terminated", "not running", "unknown", "unreachable"):
+        return "running"
     if snapshot.get("errors"):
         return "failed"
     if snapshot.get("content", {}).get("techniques"):
@@ -1551,6 +1618,7 @@ def build_scan_snapshot(root_task_id, include_logs=True):
         "logs": logs_res.get("log", []),
         "history": record.get("history", []),
         "automation": record.get("automation", {}),
+        "pending_job": record.get("pending_job"),
         "shell_probe": record.get("shell_probe", {}),
         "requested_options": normalize_requested_options(record.get("requested_options")),
         "requested_proxy": record.get("proxy", ""),
@@ -1971,6 +2039,11 @@ def build_follow_up_options(record, action, action_args):
     base.update(profile.get("options", {}))
     if record.get("proxy"):
         base["proxy"] = record["proxy"]
+    if action_args.get("threads"):
+        try:
+            base["threads"] = max(1, int(action_args.get("threads")))
+        except Exception:
+            pass
 
     if action == "initial_scan":
         if action_args.get("technique"):
@@ -2105,12 +2178,13 @@ def build_next_automation_job(root_task_id, snapshot):
             action_args = {"automation_key": automation_key("get_tables", db_name) if db_name else "get_tables"}
             if db_name:
                 action_args["db"] = db_name
+            action_args = with_fast_technique(snapshot, action_args)
             return build_automation_job(root_task_id, "get_tables", action_args)
     elif "get_tables" not in completed and not isinstance(content.get("tables"), dict):
         # Even on slow blind techniques, make one broad --tables attempt before keyword
         # search. This prevents the automation from stopping at technique detection when
         # sqlmap can enumerate tables without panel intervention.
-        return build_automation_job(root_task_id, "get_tables", {"automation_key": "get_tables"})
+        return build_automation_job(root_task_id, "get_tables", {"automation_key": "get_tables", "threads": 1})
 
     keyword = find_next_sensitive_search_keyword(completed)
     if keyword and (not fast_enum or not has_sensitive_table_candidates(snapshot)):
@@ -2145,6 +2219,7 @@ def build_next_automation_job(root_task_id, snapshot):
                 "db": db_name,
                 "table": table_name,
                 "automation_key": automation_key("get_columns", db_name, table_name),
+                "technique": preferred_fast_technique(snapshot),
             },
         )
 
@@ -2159,6 +2234,7 @@ def build_next_automation_job(root_task_id, snapshot):
                 "limit_start": 1,
                 "limit_stop": 20,
                 "automation_key": automation_key("dump_table_data", db_name, table_name),
+                "technique": preferred_fast_technique(snapshot),
             },
         )
 
@@ -2172,6 +2248,7 @@ def build_next_automation_job(root_task_id, snapshot):
                     "db": db_name,
                     "table": table_name,
                     "automation_key": automation_key("dump_first_row", db_name, table_name),
+                    "technique": preferred_fast_technique(snapshot),
                 },
             )
 
