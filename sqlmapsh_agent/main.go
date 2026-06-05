@@ -107,7 +107,7 @@ func buildCommandEnv() []string {
 
 func chooseDNSPort() string {
 	current := strings.TrimSpace(os.Getenv("SQLMAP_DNS_PORT"))
-	if current != "" {
+	if current != "" && canBindUDPPort(current) {
 		return current
 	}
 
@@ -130,6 +130,19 @@ func chooseDNSPort() string {
 	}
 
 	panic(fmt.Sprintf("no available UDP port in range %d-%d", start, end))
+}
+
+func canBindUDPPort(port string) bool {
+	parsed, err := strconv.Atoi(strings.TrimSpace(port))
+	if err != nil || parsed <= 0 || parsed > 65535 {
+		return false
+	}
+	conn, err := net.ListenPacket("udp4", net.JoinHostPort("", strconv.Itoa(parsed)))
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 func buildResolver() *net.Resolver {

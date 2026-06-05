@@ -52,13 +52,28 @@ def _can_bind_udp_port(port):
             sock.close()
 
 
-def _choose_random_port(start, end):
+def _choose_random_port(start, end, exclude=None):
+    exclude = set(exclude or [])
     candidates = list(range(start, end + 1))
     random.SystemRandom().shuffle(candidates)
     for port in candidates:
+        if port in exclude:
+            continue
         if _can_bind_udp_port(port):
             return port
     raise RuntimeError(f"no available UDP port found in range {start}-{end}")
+
+
+def _cache_dns_port(port):
+    global _CACHED_DNS_PORT
+    _CACHED_DNS_PORT = int(port)
+    os.environ[PORT_ENV] = str(_CACHED_DNS_PORT)
+    return _CACHED_DNS_PORT
+
+
+def _select_new_dns_port(exclude=None):
+    start, end = _resolve_port_range()
+    return _cache_dns_port(_choose_random_port(start, end, exclude=exclude))
 
 
 def get_dns_port():
@@ -76,12 +91,20 @@ def get_dns_port():
             raise RuntimeError(
                 f"{PORT_ENV} must be within {start}-{end}, got {configured!r}"
             )
-        _CACHED_DNS_PORT = port
+        _cache_dns_port(port)
     else:
-        _CACHED_DNS_PORT = _choose_random_port(start, end)
-        os.environ[PORT_ENV] = str(_CACHED_DNS_PORT)
+        _select_new_dns_port()
 
     return _CACHED_DNS_PORT
+
+
+def _fresh_child_dns_env():
+    env = dict(os.environ)
+    start, end = _resolve_port_range()
+    parent_port = _to_int(env.get(PORT_ENV), -1)
+    child_port = _choose_random_port(start, end, exclude={parent_port} if parent_port > 0 else None)
+    env[PORT_ENV] = str(child_port)
+    return env
 
 
 def _install_dns_server_patch():
@@ -117,20 +140,41 @@ def _install_dns_server_patch():
             )
 
     def _patched_init(self):
-        self._dns_port = get_dns_port()
-        self._check_localhost()
-        self._requests = []
-        self._lock = threading.Lock()
+        attempts = 16
+        tried = set()
+        last_error = None
 
-        try:
-            self._socket = socket._orig_socket(socket.AF_INET, socket.SOCK_DGRAM)
-        except AttributeError:
-            self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for _ in range(attempts):
+            self._dns_port = get_dns_port()
+            tried.add(self._dns_port)
+            self._requests = []
+            self._lock = threading.Lock()
+            self._socket = None
 
-        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._socket.bind(("", self._dns_port))
-        self._running = False
-        self._initialized = False
+            try:
+                self._check_localhost()
+                try:
+                    self._socket = socket._orig_socket(socket.AF_INET, socket.SOCK_DGRAM)
+                except AttributeError:
+                    self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+                self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._socket.bind(("", self._dns_port))
+                self._running = False
+                self._initialized = False
+                if len(tried) > 1:
+                    _warn(f"[sqlmap-hook] DNS port collision avoided, using UDP port {self._dns_port}")
+                return
+            except OSError as ex:
+                last_error = ex
+                if self._socket:
+                    try:
+                        self._socket.close()
+                    except Exception:
+                        pass
+                _select_new_dns_port(exclude=tried)
+
+        raise last_error or socket.error("no available DNS server UDP port")
 
     dns_module.DNSServer._check_localhost = _check_localhost
     dns_module.DNSServer.__init__ = _patched_init
@@ -184,12 +228,14 @@ def _install_api_patch():
         )
         _os.close(handle)
         api_module.saveConfig(self.options, config_file)
+        child_env = _fresh_child_dns_env()
 
         wrapper_bin = _os.getenv("SQLMAP_API_WRAPPER")
         if wrapper_bin:
             self.process = Popen(
                 [wrapper_bin, "--api", "-c", config_file],
                 shell=False,
+                env=child_env,
                 close_fds=not IS_WIN,
             )
             return
@@ -198,6 +244,7 @@ def _install_api_patch():
             self.process = Popen(
                 [_sys.executable or "python", "sqlmap.py", "--api", "-c", config_file],
                 shell=False,
+                env=child_env,
                 close_fds=not IS_WIN,
             )
         elif _os.path.exists(_os.path.join(_os.getcwd(), "sqlmap.py")):
@@ -205,6 +252,7 @@ def _install_api_patch():
                 [_sys.executable or "python", "sqlmap.py", "--api", "-c", config_file],
                 shell=False,
                 cwd=_os.getcwd(),
+                env=child_env,
                 close_fds=not IS_WIN,
             )
         elif _os.path.exists(_os.path.join(_os.path.abspath(_os.path.dirname(_sys.argv[0])), "sqlmap.py")):
@@ -212,12 +260,14 @@ def _install_api_patch():
                 [_sys.executable or "python", "sqlmap.py", "--api", "-c", config_file],
                 shell=False,
                 cwd=_os.path.join(_os.path.abspath(_os.path.dirname(_sys.argv[0]))),
+                env=child_env,
                 close_fds=not IS_WIN,
             )
         else:
             self.process = Popen(
                 ["sqlmap", "--api", "-c", config_file],
                 shell=False,
+                env=child_env,
                 close_fds=not IS_WIN,
             )
 
