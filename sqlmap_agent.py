@@ -61,6 +61,20 @@ SENSITIVE_TABLE_KEYWORDS = [
     "wp_users",
 ]
 SENSITIVE_TABLE_SEARCH_KEYWORDS = ["admin", "administrator", "user", "users", "member", "account", "manager", "staff"]
+SENSITIVE_COLUMN_SEARCH_KEYWORDS = [
+    "password",
+    "passwd",
+    "pwd",
+    "hash",
+    "salt",
+    "role",
+    "privilege",
+    "permission",
+    "is_admin",
+    "admin",
+    "username",
+    "email",
+]
 USERNAME_COLUMN_KEYWORDS = ["user", "username", "login", "email", "account", "name", "mobile", "phone"]
 PASSWORD_COLUMN_KEYWORDS = ["pass", "passwd", "password", "pwd", "hash", "salt"]
 FAST_ENUM_TECHNIQUE_KEYWORDS = ["union query", "error-based", "stacked queries", "inline query"]
@@ -1136,6 +1150,20 @@ def iter_snapshot_tables(snapshot):
     return results
 
 
+def iter_all_snapshot_tables(snapshot):
+    tables = snapshot.get("content", {}).get("tables")
+    if not isinstance(tables, dict):
+        return []
+    results = []
+    for db_name in sorted(tables.keys()):
+        table_list = tables.get(db_name) or []
+        if not isinstance(table_list, list):
+            continue
+        for table_name in sorted([str(item) for item in table_list if str(item or "").strip()]):
+            results.append((db_name, table_name))
+    return results
+
+
 def should_full_table_enum(snapshot):
     texts = []
     for item in snapshot.get("content", {}).get("techniques", []) or []:
@@ -1207,6 +1235,37 @@ def find_next_sensitive_search_keyword(completed):
         if key not in completed:
             return keyword
     return None
+
+
+def find_next_sensitive_column_search_keyword(completed):
+    for keyword in SENSITIVE_COLUMN_SEARCH_KEYWORDS:
+        key = automation_key("search_column", keyword)
+        if key not in completed:
+            return keyword
+    return None
+
+
+def has_sensitive_table_candidates(snapshot):
+    return bool(iter_snapshot_tables(snapshot))
+
+
+def has_admin_table_candidates(snapshot):
+    for _, table_name in iter_all_snapshot_tables(snapshot):
+        name = lower_name(table_name)
+        if "adm" in name or "manager" in name:
+            return True
+    return False
+
+
+def find_next_table_needing_sample(snapshot, completed):
+    for db_name, table_name in iter_all_snapshot_tables(snapshot):
+        key = automation_key("dump_first_row", db_name, table_name)
+        if key in completed:
+            continue
+        if has_dump_preview(snapshot, db_name, table_name):
+            continue
+        return db_name, table_name
+    return None, None
 
 
 def parse_search_tables(raw_value):
@@ -2039,7 +2098,8 @@ def build_next_automation_job(root_task_id, snapshot):
     if "get_dbs" not in completed and not (isinstance(dbs, list) and dbs):
         return build_automation_job(root_task_id, "get_dbs")
 
-    if should_full_table_enum(snapshot):
+    fast_enum = should_full_table_enum(snapshot)
+    if fast_enum:
         db_name = find_next_database_without_tables(snapshot, completed)
         if db_name is not None:
             action_args = {"automation_key": automation_key("get_tables", db_name) if db_name else "get_tables"}
@@ -2053,7 +2113,7 @@ def build_next_automation_job(root_task_id, snapshot):
         return build_automation_job(root_task_id, "get_tables", {"automation_key": "get_tables"})
 
     keyword = find_next_sensitive_search_keyword(completed)
-    if keyword:
+    if keyword and (not fast_enum or not has_sensitive_table_candidates(snapshot)):
         return build_automation_job(
             root_task_id,
             "search",
@@ -2061,6 +2121,18 @@ def build_next_automation_job(root_task_id, snapshot):
                 "search_kind": "table",
                 "search_query": keyword,
                 "automation_key": automation_key("search_table", keyword),
+            },
+        )
+
+    column_keyword = find_next_sensitive_column_search_keyword(completed)
+    if column_keyword and (not fast_enum or not has_sensitive_table_candidates(snapshot)):
+        return build_automation_job(
+            root_task_id,
+            "search",
+            {
+                "search_kind": "column",
+                "search_query": column_keyword,
+                "automation_key": automation_key("search_column", column_keyword),
             },
         )
 
@@ -2089,6 +2161,19 @@ def build_next_automation_job(root_task_id, snapshot):
                 "automation_key": automation_key("dump_table_data", db_name, table_name),
             },
         )
+
+    if fast_enum and not has_admin_table_candidates(snapshot):
+        db_name, table_name = find_next_table_needing_sample(snapshot, completed)
+        if db_name and table_name:
+            return build_automation_job(
+                root_task_id,
+                "dump_first_row",
+                {
+                    "db": db_name,
+                    "table": table_name,
+                    "automation_key": automation_key("dump_first_row", db_name, table_name),
+                },
+            )
 
     if "probe_shell" not in completed:
         return build_automation_job(root_task_id, "probe_shell")
