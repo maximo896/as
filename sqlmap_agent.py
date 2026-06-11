@@ -42,7 +42,7 @@ DEFAULT_SQLMAP_RISK = 3
 DEFAULT_SQLMAP_THREADS = 4
 DEFAULT_SQLMAP_TIMEOUT = 20
 DEFAULT_SQLMAP_RETRIES = 4
-AGENT_VERSION = "2.4.57"
+AGENT_VERSION = "2.4.58"
 
 SENSITIVE_TABLE_KEYWORDS = [
     "admin",
@@ -2166,6 +2166,8 @@ def build_next_automation_job(root_task_id, snapshot):
     is_dba = content.get("is_dba")
     if "check_is_dba" not in completed and is_dba is None:
         return build_automation_job(root_task_id, "check_is_dba")
+    if is_dba is True and "probe_shell" not in completed:
+        return build_automation_job(root_task_id, "probe_shell")
 
     current_db = content.get("current_db")
     if "get_current_db" not in completed and not current_db:
