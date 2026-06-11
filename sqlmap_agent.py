@@ -42,7 +42,7 @@ DEFAULT_SQLMAP_RISK = 3
 DEFAULT_SQLMAP_THREADS = 4
 DEFAULT_SQLMAP_TIMEOUT = 20
 DEFAULT_SQLMAP_RETRIES = 4
-AGENT_VERSION = "2.4.56"
+AGENT_VERSION = "2.4.57"
 
 SENSITIVE_TABLE_KEYWORDS = [
     "admin",
@@ -89,7 +89,6 @@ ENUM_ACTIONS = {
     "get_columns",
     "dump_first_row",
     "dump_table_data",
-    "search_column",
 }
 
 ENUMERATION_FALLBACK_PROFILES = [
@@ -1066,11 +1065,6 @@ def normalize_scan_data(data_rows):
     is_dba = normalize_is_dba(by_type.get("is_dba"))
     dbs = normalize_dbs(by_type.get("dbs"))
     tables = normalize_tables(by_type.get("tables"))
-    for db_name, table_list in parse_search_tables(by_type.get("search")).items():
-        existing = tables.setdefault(db_name, [])
-        for table_name in table_list:
-            if table_name not in existing:
-                existing.append(table_name)
     columns = normalize_columns(by_type.get("columns"))
     if current_db and current_db not in dbs:
         dbs = [current_db] + dbs
@@ -1386,25 +1380,6 @@ def find_next_table_needing_sample(snapshot, completed):
             continue
         return db_name, table_name
     return None, None
-
-
-def parse_search_tables(raw_value):
-    text = json.dumps(raw_value, ensure_ascii=False) if isinstance(raw_value, (dict, list)) else str(raw_value or "")
-    results = {}
-    patterns = [
-        r"Database:\s*([^\n\r\[\]]+).*?Table:\s*([^\n\r\[\]]+)",
-        r"\[([^\]]+)\]\.\[([^\]]+)\]",
-        r"`([^`]+)`\.`([^`]+)`",
-    ]
-    for pattern in patterns:
-        for db_name, table_name in re.findall(pattern, text, flags=re.I | re.S):
-            db_name = str(db_name or "").strip(" `[]'\"\t\r\n")
-            table_name = str(table_name or "").strip(" `[]'\"\t\r\n")
-            if db_name and table_name and is_sensitive_table(table_name):
-                results.setdefault(db_name, [])
-                if table_name not in results[db_name]:
-                    results[db_name].append(table_name)
-    return results
 
 
 def build_tree(content, dump_files):
@@ -1816,8 +1791,6 @@ def recovery_action_requires_args(action):
         "get_columns",
         "dump_first_row",
         "dump_table_data",
-        "search_column",
-        "search",
         "count_rows",
     }
 
@@ -2151,39 +2124,8 @@ def build_follow_up_options(record, action, action_args):
             base["db"] = action_args["db"]
         if action_args.get("table"):
             base["tbl"] = action_args["table"]
-    elif action == "search_column":
-        base["search"] = True
-        if action_args.get("db"):
-            base["db"] = action_args["db"]
-        if action_args.get("table"):
-            base["tbl"] = action_args["table"]
-        column_name = str(action_args.get("column") or "").strip()
-        if not column_name:
-            raise ValueError("column is required for search_column")
-        base["col"] = column_name
-    elif action == "search":
-        base["search"] = True
-        search_kind = str(action_args.get("search_kind") or "").strip().lower()
-        search_query = str(action_args.get("search_query") or "").strip()
-        if not search_query:
-            raise ValueError("search_query is required for search")
-        if search_kind == "database":
-            base["db"] = search_query
-        elif search_kind == "table":
-            base["tbl"] = search_query
-            if action_args.get("db"):
-                base["db"] = action_args["db"]
-        elif search_kind == "column":
-            base["col"] = search_query
-            if action_args.get("db"):
-                base["db"] = action_args["db"]
-            if action_args.get("table"):
-                base["tbl"] = action_args["table"]
-        elif search_kind == "data":
-            base["search"] = False
-            raise ValueError("data search is not supported by sqlmap --search")
-        else:
-            raise ValueError("unsupported search_kind")
+    elif action in ("search_column", "search"):
+        raise ValueError("sqlmap --search is disabled; use structured enumeration results")
     elif action == "probe_shell":
         base["osCmd"] = action_args.get("command") or "echo sqlmap"
     else:
@@ -2233,44 +2175,15 @@ def build_next_automation_job(root_task_id, snapshot):
     if "get_dbs" not in completed and not (isinstance(dbs, list) and dbs):
         return build_automation_job(root_task_id, "get_dbs")
 
-    fast_enum = should_full_table_enum(snapshot)
-    if fast_enum:
-        db_name = find_next_database_without_tables(snapshot, completed)
-        if db_name is not None:
-            action_args = {"automation_key": automation_key("get_tables", db_name) if db_name else "get_tables"}
-            if db_name:
-                action_args["db"] = db_name
+    db_name = find_next_database_without_tables(snapshot, completed)
+    if db_name is not None:
+        action_args = {"automation_key": automation_key("get_tables", db_name) if db_name else "get_tables"}
+        if db_name:
+            action_args["db"] = db_name
             action_args = with_fast_technique(snapshot, action_args)
-            return build_automation_job(root_task_id, "get_tables", action_args)
-    elif "get_tables" not in completed and not isinstance(content.get("tables"), dict):
-        # Even on slow blind techniques, make one broad --tables attempt before keyword
-        # search. This prevents the automation from stopping at technique detection when
-        # sqlmap can enumerate tables without panel intervention.
-        return build_automation_job(root_task_id, "get_tables", {"automation_key": "get_tables", "threads": 1})
-
-    keyword = find_next_sensitive_search_keyword(completed)
-    if keyword and (not fast_enum or not has_sensitive_table_candidates(snapshot)):
-        return build_automation_job(
-            root_task_id,
-            "search",
-            {
-                "search_kind": "table",
-                "search_query": keyword,
-                "automation_key": automation_key("search_table", keyword),
-            },
-        )
-
-    column_keyword = find_next_sensitive_column_search_keyword(completed)
-    if column_keyword and (not fast_enum or not has_sensitive_table_candidates(snapshot)):
-        return build_automation_job(
-            root_task_id,
-            "search",
-            {
-                "search_kind": "column",
-                "search_query": column_keyword,
-                "automation_key": automation_key("search_column", column_keyword),
-            },
-        )
+        else:
+            action_args["threads"] = 1
+        return build_automation_job(root_task_id, "get_tables", action_args)
 
     db_name, table_name = find_next_sensitive_table_needing_columns(snapshot, completed)
     if db_name and table_name:
@@ -2526,7 +2439,7 @@ def run_action(root_task_id):
 
     data = request.json or {}
     action = data.get("action")
-    if action not in ("initial_scan", "check_is_dba", "get_current_db", "get_dbs", "get_tables", "get_columns", "dump_first_row", "dump_table_data", "search_column", "probe_shell", "search", "count_rows"):
+    if action not in ("initial_scan", "check_is_dba", "get_current_db", "get_dbs", "get_tables", "get_columns", "dump_first_row", "dump_table_data", "probe_shell", "count_rows"):
         return jsonify({"error": "Unsupported action"}), 400
 
     snapshot = build_scan_snapshot(root_task_id, include_logs=False)
