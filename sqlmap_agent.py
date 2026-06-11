@@ -42,7 +42,7 @@ DEFAULT_SQLMAP_RISK = 3
 DEFAULT_SQLMAP_THREADS = 4
 DEFAULT_SQLMAP_TIMEOUT = 20
 DEFAULT_SQLMAP_RETRIES = 4
-AGENT_VERSION = "2.4.55"
+AGENT_VERSION = "2.4.56"
 
 SENSITIVE_TABLE_KEYWORDS = [
     "admin",
@@ -77,6 +77,7 @@ SENSITIVE_COLUMN_SEARCH_KEYWORDS = [
 ]
 USERNAME_COLUMN_KEYWORDS = ["user", "username", "login", "email", "account", "name", "mobile", "phone"]
 PASSWORD_COLUMN_KEYWORDS = ["pass", "passwd", "password", "pwd", "hash", "salt"]
+PRIORITY_PASSWORD_COLUMN_KEYWORDS = ["password", "passwd", "pass", "pwd", "pass_hash", "password_hash"]
 FAST_ENUM_TECHNIQUE_KEYWORDS = ["union query", "error-based", "stacked queries", "inline query"]
 SLOW_ENUM_TECHNIQUE_KEYWORDS = ["time-based blind", "boolean-based blind"]
 
@@ -1108,10 +1109,10 @@ def merge_content(previous, current):
     return merged
 
 
-def choose_priority_table(table_names):
+def choose_priority_table(table_names, table_map=None):
     if not table_names:
         return None
-    sensitive = choose_sensitive_tables(table_names)
+    sensitive = choose_sensitive_tables(table_names, table_map)
     if sensitive:
         return sensitive[0]
     return sorted(table_names)[0]
@@ -1128,11 +1129,55 @@ def is_sensitive_table(table_name):
     return any(keyword in name for keyword in SENSITIVE_TABLE_KEYWORDS)
 
 
-def choose_sensitive_tables(table_names):
+def is_admin_table(table_name):
+    name = lower_name(table_name)
+    return any(keyword in name for keyword in ("adm", "admin", "administrator", "manager", "staff", "root"))
+
+
+def is_priority_password_column(column_name):
+    name = lower_name(column_name)
+    if not name:
+        return False
+    return any(keyword in name for keyword in PRIORITY_PASSWORD_COLUMN_KEYWORDS)
+
+
+def table_columns_from_tree_item(table):
+    if not isinstance(table, dict):
+        return []
+    columns = []
+    raw_columns = table.get("columns")
+    if isinstance(raw_columns, list):
+        columns.extend(raw_columns)
+    column_types = table.get("column_types")
+    if isinstance(column_types, dict):
+        columns.extend(column_types.keys())
+    for row in table.get("rows") or []:
+        if isinstance(row, dict):
+            columns.extend(row.keys())
+    return list(dict.fromkeys([str(item) for item in columns if str(item or "").strip()]))
+
+
+def table_has_priority_password_columns_from_tree(table):
+    return any(is_priority_password_column(column) for column in table_columns_from_tree_item(table))
+
+
+def choose_sensitive_tables(table_names, table_map=None):
     ordered = sorted([str(item) for item in table_names or [] if str(item or "").strip()])
-    admin_matches = [item for item in ordered if "adm" in lower_name(item) or "manager" in lower_name(item)]
-    other_matches = [item for item in ordered if item not in admin_matches and is_sensitive_table(item)]
-    return admin_matches + other_matches
+    table_map = table_map or {}
+    password_matches = [
+        item
+        for item in ordered
+        if table_has_priority_password_columns_from_tree(table_map.get(item))
+    ]
+    password_admin_matches = [item for item in password_matches if is_admin_table(item)]
+    password_other_matches = [item for item in password_matches if item not in password_admin_matches]
+    admin_matches = [item for item in ordered if item not in password_matches and is_admin_table(item)]
+    other_matches = [
+        item
+        for item in ordered
+        if item not in password_matches and item not in admin_matches and is_sensitive_table(item)
+    ]
+    return password_admin_matches + password_other_matches + admin_matches + other_matches
 
 
 def automation_key(prefix, *parts):
@@ -1162,6 +1207,10 @@ def table_has_credential_columns(snapshot, database_name, table_name):
     has_password = any(any(keyword in column for keyword in PASSWORD_COLUMN_KEYWORDS) for column in columns)
     has_username = any(any(keyword in column for keyword in USERNAME_COLUMN_KEYWORDS) for column in columns)
     return has_password and (has_username or is_sensitive_table(table_name))
+
+
+def table_has_priority_password_columns(snapshot, database_name, table_name):
+    return any(is_priority_password_column(item) for item in table_columns_from_snapshot(snapshot, database_name, table_name))
 
 
 def iter_snapshot_tables(snapshot):
@@ -1272,7 +1321,20 @@ def find_next_sensitive_table_needing_columns(snapshot, completed):
 
 
 def find_next_sensitive_table_needing_dump(snapshot, completed):
-    for db_name, table_name in iter_snapshot_tables(snapshot):
+    candidates = iter_snapshot_tables(snapshot)
+    priority_candidates = [
+        item for item in candidates if table_has_priority_password_columns(snapshot, item[0], item[1])
+    ]
+    priority_candidates.sort(key=lambda item: (0 if is_admin_table(item[1]) else 1, lower_name(item[1])))
+    for db_name, table_name in priority_candidates:
+        key = automation_key("dump_table_data", db_name, table_name)
+        if key in completed:
+            continue
+        if has_dump_preview(snapshot, db_name, table_name):
+            continue
+        return db_name, table_name
+
+    for db_name, table_name in candidates:
         key = automation_key("dump_table_data", db_name, table_name)
         if key in completed:
             continue
@@ -1425,7 +1487,7 @@ def build_tree(content, dump_files):
     databases = []
     for database in database_map.values():
         table_names = list(database["_table_map"].keys())
-        priority_table = choose_priority_table(table_names)
+        priority_table = choose_priority_table(table_names, database["_table_map"])
         tables_list = []
         for table_name in sorted(table_names):
             table = database["_table_map"][table_name]
