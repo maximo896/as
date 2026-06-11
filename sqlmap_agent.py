@@ -999,6 +999,9 @@ def is_sqlmap_noise_line(value):
         return True
     noise_tokens = (
         "do you want to merge them in further requests?",
+        "do you want to apply it from now on?",
+        "got a refresh intent",
+        "redirect like response common to login pages",
         "you provided a http cookie header value",
         "multi-threading is considered unsafe in time-based data retrieval",
         "are you sure of your choice (breaking warranty)",
@@ -1402,6 +1405,8 @@ def build_tree(content, dump_files):
                 "name": table_name,
                 "columns": [],
                 "column_types": {},
+                "confirmed_column_count": 0,
+                "preview_column_count": 0,
                 "rows": [],
             }
         return database["_table_map"][table_name]
@@ -1434,6 +1439,7 @@ def build_tree(content, dump_files):
                 if isinstance(column_map, dict):
                     table["column_types"] = column_map
                     table["columns"] = sorted(column_map.keys())
+                    table["confirmed_column_count"] = len(column_map)
 
     counts = content.get("count")
     if isinstance(counts, dict):
@@ -1455,7 +1461,9 @@ def build_tree(content, dump_files):
             table = ensure_table(database, table_name)
             preview_columns = table_preview.get("columns", [])
             if preview_columns:
-                table["columns"] = preview_columns
+                table["preview_column_count"] = len(preview_columns)
+                if not table.get("confirmed_column_count"):
+                    table["columns"] = preview_columns
             if table_preview.get("rows"):
                 table["rows"] = table_preview["rows"]
 
@@ -1727,6 +1735,16 @@ def has_dump_preview(snapshot, database_name, table_name):
     return False
 
 
+def has_row_count_for_table(snapshot, database_name, table_name):
+    counts = snapshot.get("content", {}).get("count")
+    if not isinstance(counts, dict):
+        return False
+    db_tables = counts.get(database_name) or {}
+    if not isinstance(db_tables, dict):
+        return False
+    return table_name in db_tables and db_tables.get(table_name) not in (None, "")
+
+
 def get_fallback_profile(index):
     try:
         normalized = int(index or 0)
@@ -1756,6 +1774,8 @@ def action_has_meaningful_result(snapshot, action, action_args):
         return any(bool(value) for value in tables.values())
     if action == "get_columns":
         return bool(database_name and table_name and has_columns_for_table(snapshot, database_name, table_name))
+    if action == "count_rows":
+        return bool(database_name and table_name and has_row_count_for_table(snapshot, database_name, table_name))
     if action in ("dump_first_row", "dump_table_data"):
         return bool(database_name and table_name and has_dump_preview(snapshot, database_name, table_name))
     if action == "search":
